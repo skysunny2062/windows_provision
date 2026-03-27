@@ -1,0 +1,17 @@
+Windows Registry Editor Version 5.00
+
+; ── Office 停用受保護的檢視 ──────────────────────────────
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Excel\Security\ProtectedView]
+"DisableAttachmentsInPV"=dword:00000001
+"DisableInternetFilesInPV"=dword:00000001
+"DisableUnsafeLocationsInPV"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Word\Security\ProtectedView]
+"DisableAttachmentsInPV"=dword:00000001
+"DisableInternetFilesInPV"=dword:00000001
+"DisableUnsafeLocationsInPV"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\PowerPoint\Security\ProtectedView]
+"DisableAttachmentsInPV"=dword:00000001
+"DisableInternetFilesInPV"=dword:00000001
+"DisableUnsafeLocationsInPV"=dword:00000001

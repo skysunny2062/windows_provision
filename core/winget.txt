@@ -1,0 +1,14 @@
+# core\winget.txt
+# 格式: pkg_id[,exact][,msstore]
+# exact  = 加 -e 旗標精確匹配
+# msstore = 從 Microsoft Store 安裝，否則預設 winget
+# name=顯示名稱
+
+XPFCC4CD725961,msstore,name=LINE
+CrystalDewWorld.CrystalDiskInfo.AoiEdition,exact
+Daum.PotPlayer
+Discord.Discord
+Google.Chrome
+PuTTY.PuTTY
+IObit.DriverBooster
+RARLab.WinRAR

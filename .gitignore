@@ -1,0 +1,14 @@
+__pycache__/
+setup/
+core/font/*
+zack/*
+
+*.img
+Thumbs.db
+
+!*.reg
+!思源黑体 CN Heavy.otf
+!winget.txt
+!check_upstream.py
+!check_upstream_reference.docx
+!zack.py

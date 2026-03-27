@@ -1,0 +1,62 @@
+Windows Registry Editor Version 5.00
+
+; ── 工作列 ──────────────────────────────────────────────
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Search]
+"SearchboxTaskbarMode"=dword:00000000
+
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced]
+"TaskbarAl"=dword:00000001
+"TaskbarDa"=dword:00000000
+"ShowTaskViewButton"=dword:00000000
+"ShowSecondsInSystemClock"=dword:00000001
+"TaskbarGlomLevel"=dword:00000002
+
+; ── 佈景主題 ──────────────────────────────────────────────
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize]
+"ColorPrevalence"=dword:00000001
+
+; ── 還原舊版右鍵選單 ─────────────────────────────────────
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32]
+@=""
+
+; ── Shell Icons────────────────────────────────────────
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons]
+"29"="C:\\Windows\\system32\\imageres.dll,197"
+"77"="C:\\Windows\\system32\\imageres.dll,197"
+
+; ── 電源選單（顯示休眠、隱藏睡眠）────────────────────────
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FlyoutMenuSettings]
+"ShowHibernateOption"=dword:00000001
+"ShowSleepOption"=dword:00000000
+
+; ── 電源設定（連接電源時不允許待機）──────────────────────
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Power\PowerSettings\96996BC0-AD50-47EC-923B-6F41874DD9EB]
+"ACSettingIndex"=dword:00000002
+
+; ── 指令提示字元 UNC 路徑 ────────────────────────────────
+[HKEY_CURRENT_USER\Software\Microsoft\Command Processor]
+"DisableUNCCheck"=dword:00000001
+
+; ── 相片檢視器背景黑色 ───────────────────────────────────
+[HKEY_CURRENT_USER\Software\Microsoft\Windows Photo Viewer\Viewer]
+"BackgroundColor"=dword:ff000000
+
+; ── 可靠度監視器（停用時間戳）───────────────────────────
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability]
+"TimeStampInterval"=dword:00000000
+
+; ── 記憶體管理 ───────────────────────────────────────────
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\Session Manager\Memory Management]
+"DisablePagingExecutive"=dword:00000001
+
+
+; ── Win11原生NVMe支援 ──────────────────────────
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides]
+"735209102"=dword:00000001
+"1853569164"=dword:00000001
+"156965516"=dword:00000001
+
+; ── ZoneMap 區域網路信任 ─────────────────────────────────
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap\Ranges\Range1]
+"*"=dword:00000001
+":Range"="192.168.*.*"
