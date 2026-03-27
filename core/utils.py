@@ -1,69 +1,91 @@
 """
-core/utils.py  ─ 共用工具函式
+core/utils.py ─ 共用工具函式
 
-main.py 與外掛（zack/zack.py 等）都可 import 使用。
-不包含任何路徑常數，呼叫端自行管理路徑。
+提供 main.py 與其他擴充外掛（如 zack/zack.py 等）匯入使用的通用工具。
+本模組不包含任何絕對路徑常數，路徑狀態由呼叫端自行管理與傳遞。
 """
 
 import datetime
 import os
 import subprocess
+from dataclasses import dataclass, field
 
-# ── Log（全域狀態由 main.py 持有，這裡只提供寫入介面）──
-_FAILURES: list = []        # main.py 啟動時會以 main.FAILURES 取代參照
-_LOG_PATH: list = [None]    # 用 list 包裝，方便外部修改同一物件
+# ── 全域狀態管理 ──────────────────────────────────────
+@dataclass
+class Failure:
+    """紀錄執行失敗的詳細資訊"""
+    ts:       str
+    category: str
+    label:    str
+    detail:   str = ""
 
+@dataclass
+class _State:
+    """全域狀態容器，負責收集執行過程中的錯誤"""
+    failures: list[Failure] = field(default_factory=list)
 
-def _now():
+state = _State()
+
+def _now() -> str:
+    """取得當前時間字串 (HH:MM:SS)"""
     return datetime.datetime.now().strftime("%H:%M:%S")
 
-
 def info(msg: str):
+    """印出帶有時間戳記的一般資訊"""
     print(f"[{_now()}] {msg}")
 
-
 def error(category: str, label: str, detail: str = ""):
+    """
+    記錄錯誤至全域狀態，並印出錯誤訊息。
+    這將用於最終的 Log 報告產生。
+    """
     ts = _now()
-    _FAILURES.append((ts, category, label, detail))
+    state.failures.append(Failure(ts, category, label, detail))
     print(f"[{ts}] FAIL [{category}] {label}{' - ' + detail if detail else ''}")
 
-
-# ── 檔案 IO ───────────────────────────────────────────
-def run_silent(cmd, *, cwd=None, check=False, capture=False, **kwargs):
+# ── 子行程執行工具 ────────────────────────────────────
+def run_quiet(cmd, *, cwd=None, capture=False, **kwargs):
+    """
+    靜默執行系統指令，不拋出例外。
+    錯誤處理與 Policy 由各個呼叫端自行負責。
+    
+    :param capture: 若為 True，則將 stdout/stderr 導向 PIPE；否則導向 DEVNULL。
+    :return: CompletedProcess 實例，若執行發生例外則回傳 None。
+    """
     pipe = subprocess.PIPE if capture else subprocess.DEVNULL
     try:
         return subprocess.run(cmd, stdout=pipe, stderr=pipe,
-                              cwd=cwd, check=check, **kwargs)
-    except subprocess.CalledProcessError as e:
-        error("Process", " ".join(map(str, cmd)), f"returncode={e.returncode}")
+                              cwd=cwd, **kwargs)
     except Exception as e:
         error("Process", " ".join(map(str, cmd)), str(e))
+        return None
 
+# ── 檔案系統與 IO 工具 ────────────────────────────────
+def fix_acl(path: str):
+    """重設目標路徑的存取控制清單 (ACL)，並賦予 Administrators 群組完整控制權"""
+    run_quiet(["icacls", path, "/reset", "/t", "/c"])
+    run_quiet(["icacls", path, "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/t", "/c"])
 
-def _fix_acl(path: str):
-    run_silent(["icacls", path, "/reset", "/t", "/c"])
-    run_silent(["icacls", path, "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/t", "/c"])
-
-
-def _robocopy(src: str, dst: str):
-    subprocess.run(["robocopy", src, dst, "/mir", "/mt:8", "/r:10", "/w:3"])
-
+def robocopy(src: str, dst: str):
+    """使用 robocopy 進行多執行緒鏡像複製 (支援重試機制)"""
+    r = subprocess.run(["robocopy", src, dst, "/mir", "/mt:8", "/r:10", "/w:3"])
+    # robocopy 結束代碼 >= 8 代表發生嚴重錯誤
+    if r.returncode >= 8:
+        error("IO", f"robocopy {src}", f"returncode={r.returncode}")
 
 def robocopy_folder(src: str, dst: str):
-    """robocopy /mir + ACL 重設"""
-    _robocopy(src, dst)
-    _fix_acl(dst)
-
+    """執行資料夾鏡像複製，並於複製完成後重設目標資料夾的 ACL 權限"""
+    robocopy(src, dst)
+    fix_acl(dst)
 
 def xcopy_folder(src: str, dst: str):
-    """xcopy /s /y，失敗時記錄 error"""
-    r = run_silent(["xcopy", "/s", "/y", src, dst])
+    """使用 xcopy 複製資料夾內容，並於失敗時記錄錯誤"""
+    r = run_quiet(["xcopy", "/s", "/y", src, dst])
     if r and r.returncode not in (0, 1):
         error("IO", f"xcopy {src}", f"returncode={r.returncode}")
 
-
 def sync_programfiles(source_dir: str, target_root: str):
-    """將 source_dir 下的各子資料夾 robocopy 到 target_root"""
+    """將來源目錄下的所有子資料夾，逐一透過 robocopy 同步至目標根目錄"""
     if not os.path.isdir(source_dir):
         return
     for folder in os.listdir(source_dir):
@@ -72,9 +94,8 @@ def sync_programfiles(source_dir: str, target_root: str):
         if os.path.isdir(src):
             robocopy_folder(src, dst)
 
-
-def safe_listdir(path: str) -> list:
-    """路徑不存在時回傳空列表，不拋例外"""
+def safe_listdir(path: str) -> list[str]:
+    """安全讀取目錄內容，若路徑不存在則回傳空列表，避免拋出 FileNotFoundError"""
     if not os.path.isdir(path):
         return []
     return os.listdir(path)

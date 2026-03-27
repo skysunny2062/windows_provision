@@ -7,7 +7,7 @@ _REQUIRED_MODULES = [
 ]
 
 def ensure_modules(mods, max_restart=2):
-    """自動安裝缺少的 pip 套件，失敗超過 max_restart 次則中止"""
+    """自動安裝缺少的 pip 套件，若失敗超過 max_restart 次則中止腳本"""
     missing = [pip for pip, imp in mods if importlib.util.find_spec(imp) is None]
     if not missing:
         return
@@ -40,12 +40,13 @@ def ensure_modules(mods, max_restart=2):
 
 ensure_modules(_REQUIRED_MODULES)
 
-_UTILS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+_UTILS_PATH = os.path.dirname(os.path.abspath(__file__))
 if _UTILS_PATH not in sys.path:
     sys.path.insert(0, _UTILS_PATH)
 from utils import (
-    info, error, _FAILURES,
-    run_silent, _fix_acl, _robocopy,
+    info, error, state,
+    run_quiet,
+    fix_acl, robocopy,
     robocopy_folder, xcopy_folder, sync_programfiles, safe_listdir,
 )
 import base64
@@ -62,10 +63,18 @@ import urllib.request
 import winreg
 import win32gui
 import win32con
+from concurrent.futures import ThreadPoolExecutor
+from functools import cache, lru_cache
 
-PROGRAM_NAME = "Zack Provision Ver260327"
+# ── 視窗與系統常數 ────────────────────────────────────
+_HWND_TOPMOST   = ctypes.wintypes.HWND(-1)
+_HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
+_SWP_FLAGS      = 0x0001 | 0x0002  # SWP_NOSIZE | SWP_NOMOVE
+
+PROGRAM_NAME = "Zack Provision Ver260328"
+
 # ── 路徑定義 ──────────────────────────────────────────
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # core\
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # core 目錄
 ROOT_DIR   = os.path.dirname(SCRIPT_DIR)                 # 根目錄
 
 CORE_REG_DIR = os.path.join(SCRIPT_DIR, "reg")
@@ -73,8 +82,8 @@ CORE_SETUP   = os.path.join(SCRIPT_DIR, "setup")
 CORE_THEMES  = os.path.join(SCRIPT_DIR, "themes")
 CORE_WINDIR  = os.path.join(SCRIPT_DIR, "windir")
 CORE_WINGET  = os.path.join(SCRIPT_DIR, "winget.txt")
-
 CORE_FONTS   = os.path.join(SCRIPT_DIR, "font")
+
 WINDIR        = os.environ["windir"]
 SYSTEM_FONTS  = os.path.join(WINDIR, "Fonts")
 FONTS_REG    = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
@@ -87,7 +96,7 @@ TEMP          = os.environ["TEMP"]
 PROGRAM_DATA  = os.environ["ProgramData"]
 COMPUTERNAME  = socket.gethostname()
 
-# ── 使用者資料夾定義（備份/還原共用）────────────────
+# ── 使用者資料夾定義（用於備份與還原功能）────────────
 _USER_FOLDERS = [
     ("桌面", "Desktop"),
     ("下載", "Downloads"),
@@ -101,8 +110,8 @@ _BACKUP_LABELS = {label for label, _ in _USER_FOLDERS} | {"AnyDesk"}
 # ── 外掛模組偵測 ──────────────────────────────────────
 def _detect_plugins():
     """
-    掃描 ROOT_DIR 下的子資料夾，若 xxx/xxx.py 存在則載入為外掛。
-    回傳 dict：{ "Xxx Mode": (module, xxx_dir) }
+    掃描根目錄下的子資料夾，若符合 `目錄名/目錄名.py` 格式則自動載入為擴充外掛。
+    回傳字典：{ "Xxx Mode": (module, plugin_dir) }
     """
     plugins = {}
     try:
@@ -122,15 +131,15 @@ def _detect_plugins():
         pass
     return plugins
 
-PLUGINS = _detect_plugins()   # { "xxx Mode": (module, path), ... }
+PLUGINS = _detect_plugins()
 
-# ── winget.txt 解析 ───────────────────────────────────
+# ── winget.txt 解析──────────────────────────────────
+@lru_cache(maxsize=None)
 def _parse_winget_txt(path):
     """
-    解析 winget.txt，每行格式：
-      pkg_id[,exact][,msstore][,name=顯示名稱]
-    回傳 list of (pkg_id, exact:bool, source:str, display_name:str|None)
-    忽略空行與 # 開頭的註解行。
+    解析 winget 清單檔，每行格式支援：pkg_id[,exact][,msstore][,name=顯示名稱]
+    忽略空行與以 '#' 開頭的註解行。
+    回傳 Tuple 列表：(pkg_id, exact:bool, source:str, display_name:str|None)
     """
     pkgs = []
     if not os.path.isfile(path):
@@ -140,20 +149,21 @@ def _parse_winget_txt(path):
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            parts       = [p.strip() for p in line.split(",")]
-            pkg_id      = parts[0]
-            exact       = "exact" in parts[1:]
-            source      = "msstore" if "msstore" in parts[1:] else "winget"
-            name_part   = next((p for p in parts[1:] if p.lower().startswith("name=")), None)
-            display_name = name_part.split("=", 1)[1] if name_part else None
+            parts        = [p.strip() for p in line.split(",")]
+            pkg_id       = parts[0]
+            flags        = set(parts[1:])
+            exact        = "exact" in flags
+            source       = "msstore" if "msstore" in flags else "winget"
+            name_kv      = next((p for p in flags if p.lower().startswith("name=")), None)
+            display_name = name_kv.split("=", 1)[1] if name_kv else None
             pkgs.append((pkg_id, exact, source, display_name))
     return pkgs
 
-# ── 進度 Log ──────────────────────────────────────────
+# ── 狀態與日誌追蹤 ────────────────────────────────────
 LOG_PATH = None
-FAILURES = _FAILURES   # utils 持有的同一份 list
+FAILURES = state.failures
 
-# ── UI 工具 ───────────────────────────────────────────
+# ── UI 與視窗工具 ─────────────────────────────────────
 def _print_header():
     os.system("cls")
     print(PROGRAM_NAME)
@@ -161,50 +171,49 @@ def _print_header():
         print(f"PC-NAME: {COMPUTERNAME}")
     print()
 
-# ── 工具函式 ──────────────────────────────────────────
-_CONSOLE_HWND_CACHE = None
-
+@cache
 def _get_console_hwnd():
-    global _CONSOLE_HWND_CACHE
-    if _CONSOLE_HWND_CACHE:
-        return _CONSOLE_HWND_CACHE
+    """取得當前主控台的視窗代碼 (HWND)"""
     hwnd = win32gui.FindWindow("CASCADIA_HOSTING_WINDOW_CLASS", None)
     if not hwnd:
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-    _CONSOLE_HWND_CACHE = hwnd
     return hwnd
 
 def _maximize_console():
+    """將主控台視窗最大化並設為最上層顯示"""
     try:
         hwnd = _get_console_hwnd()
         if hwnd:
             user32 = ctypes.windll.user32
             user32.ShowWindow(hwnd, 3)
-            HWND_TOPMOST = ctypes.wintypes.HWND(-1)
-            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002)
+            user32.SetWindowPos(hwnd, _HWND_TOPMOST, 0, 0, 0, 0, _SWP_FLAGS)
     except Exception as e:
         error("Warning", "maximize_console", str(e))
 
 def _release_topmost():
+    """解除主控台最上層顯示"""
     try:
         hwnd = _get_console_hwnd()
         if hwnd:
-            HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
-            ctypes.windll.user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, 0x0001 | 0x0002)
+            ctypes.windll.user32.SetWindowPos(hwnd, _HWND_NOTOPMOST, 0, 0, 0, 0, _SWP_FLAGS)
     except Exception as e:
         error("Warning", "release_topmost", str(e))
 
+# ── 系統核心工具函式 ──────────────────────────────────
 def import_reg(path):
-    r = run_silent(["reg", "import", path])
+    """匯入單一登錄檔 (.reg)"""
+    r = run_quiet(["reg", "import", path])
     if r and r.returncode != 0:
         print(f"新增REG失敗: {os.path.basename(path)} (code {r.returncode})")
         error("Registry", os.path.basename(path), f"returncode={r.returncode}")
 
 def import_reg_dir(dir_path):
+    """匯入指定目錄下的所有登錄檔 (.reg)"""
     for f in safe_listdir(dir_path):
         if f.lower().endswith(".reg"):
             import_reg(os.path.join(dir_path, f))
 
+# 保留手動快取機制，允許在階段安裝 (Phase Git) 後強制清除重查路徑
 _GIT_EXE_CACHE = None
 
 def _get_git_exe():
@@ -221,6 +230,7 @@ def _get_git_exe():
     return _GIT_EXE_CACHE
 
 def _inject_git_path():
+    """動態將 Git 路徑注入至當前環境變數，確保後續指令可直接調用"""
     try:
         git_exe = _get_git_exe()
         if git_exe == "git":
@@ -239,6 +249,7 @@ def _inject_git_path():
         info(f"_inject_git_path: 無法注入 PATH ({e})")
 
 def download_file(url, dest, retries=3):
+    """下載檔案，預設關閉 SSL 憑證驗證以避免內網或憑證過期問題"""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode    = ssl.CERT_NONE
@@ -260,7 +271,7 @@ def reg_set(hive, key, name, reg_type, value):
         print(f"REG 失敗 [{key}] {name}: {e}")
 
 def sc_disable(service):
-    r = run_silent(["sc", "config", service, "start=", "disabled"])
+    r = run_quiet(["sc", "config", service, "start=", "disabled"])
     return r is not None and r.returncode in (0, 1060)
 
 def sc_disable_retry(service):
@@ -271,12 +282,19 @@ def sc_disable_retry(service):
     error("Service", service, "sc config failed")
 
 def schtasks_delete(task):
-    run_silent(["schtasks", "/delete", "/tn", task, "/f"])
+    run_quiet(["schtasks", "/delete", "/tn", task, "/f"])
 
-# ── Retry 機制 ────────────────────────────────────────
-pending_final_retry = []
+# ── 通用等待機制 (Polling Helper) ─────────────────────
+def _wait_until(cond_fn, timeout=10, interval=0.1) -> bool:
+    """定期檢查給定條件 (cond_fn) 是否成立，用於等待視窗或特定進程出現"""
+    for _ in range(int(timeout / interval)):
+        if cond_fn():
+            return True
+        time.sleep(interval)
+    return False
 
-def winget_install_pkg(pkg, exact=False, source="winget"):
+# ── 重試與安裝機制 ────────────────────────────────────
+def winget_install_pkg(pkg, exact=False, source="winget", _retry_queue=None):
     cmd = ["winget", "install", "--id", pkg,
            "--source", source, "--silent",
            "--accept-package-agreements", "--accept-source-agreements",
@@ -289,6 +307,7 @@ def winget_install_pkg(pkg, exact=False, source="winget"):
             time.sleep(5)
         try:
             r = subprocess.run(cmd, timeout=600)
+            # 處理已知的 winget 成功與警告回傳碼
             if r.returncode in (0, -1978335189, -1978335140, 2316632107):
                 return True
         except subprocess.TimeoutExpired:
@@ -296,15 +315,17 @@ def winget_install_pkg(pkg, exact=False, source="winget"):
         except Exception as e:
             info(f"  例外 {pkg}: {e}")
     info(f"  → {pkg} 加入 final retry 佇列")
-    pending_final_retry.append((pkg, cmd))
+    if _retry_queue is not None:
+        _retry_queue.append((pkg, cmd))
     return False
 
-def _final_retry_installers():
-    if not pending_final_retry:
+def _final_retry_installers(pending):
+    """在部署尾聲統一對先前失敗的安裝項目進行最終重試"""
+    if not pending:
         return
-    print(f"\n── Error Retry ({len(pending_final_retry)} 個) ──")
+    print(f"\n── Error Retry ({len(pending)} 個) ──")
     time.sleep(15)
-    for label, cmd in pending_final_retry:
+    for label, cmd in pending:
         info(f"  error retry: {label}")
         try:
             r = subprocess.run(cmd)
@@ -316,6 +337,7 @@ def _final_retry_installers():
             error("Installer", label, str(e))
 
 def _get_font_reg_name(font_path):
+    """解析字型檔 (TTF/OTF) 的二進位標頭，取得系統登錄檔中需註冊的字型名稱"""
     ext = os.path.splitext(font_path)[1].lower()
     type_suffix = "(OpenType)" if ext == ".otf" else "(TrueType)"
     try:
@@ -358,7 +380,7 @@ def _get_font_reg_name(font_path):
     return f"{os.path.splitext(os.path.basename(font_path))[0]} {type_suffix}"
 
 def install_fonts(font_dir):
-    """複製字型到 C:\\Windows\\Fonts，已存在就跳過，並寫入 Registry"""
+    """將字型複製至系統字型庫，跳過已存在的檔案，並寫入對應登錄檔"""
     print()
     if not os.path.isdir(font_dir):
         return
@@ -376,7 +398,7 @@ def install_fonts(font_dir):
             continue
         src = os.path.join(font_dir, fname)
         try:
-            run_silent(["xcopy", "/y", src, SYSTEM_FONTS + "\\"])
+            run_quiet(["xcopy", "/y", src, SYSTEM_FONTS + "\\"])
             reg_name = _get_font_reg_name(src)
             reg_set(winreg.HKEY_LOCAL_MACHINE, FONTS_REG, reg_name, winreg.REG_SZ, fname)
             installed += 1
@@ -394,23 +416,27 @@ def _find_button(root, targets):
     return None
 
 def set_best_appearance(timeout=10):
+    """自動開啟系統效能選項，並點選「調整成最佳外觀」"""
     subprocess.Popen("SystemPropertiesPerformance.exe")
     hwnd = None
-    for _ in range(timeout * 10):
+    def _find():
+        nonlocal hwnd
         hwnd = win32gui.FindWindow(None, "效能選項")
-        if hwnd:
-            break
-        time.sleep(0.1)
-    if not hwnd:
+        return bool(hwnd)
+    
+    if not _wait_until(_find, timeout=timeout):
         info("set_best_appearance: 視窗未出現，跳過")
         return
+    
     tab_hwnd = win32gui.FindWindowEx(hwnd, None, "#32770", None)
     search_root = tab_hwnd if tab_hwnd else hwnd
     btn = _find_button(search_root, ["最佳外觀", "best appearance"])
+    
     if not btn:
         info("set_best_appearance: 找不到最佳外觀按鈕，跳過")
         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         return
+    
     win32gui.PostMessage(btn, win32con.BM_CLICK, 0, 0)
     time.sleep(0.2)
     btn = _find_button(hwnd, ["確定", "OK"])
@@ -419,16 +445,14 @@ def set_best_appearance(timeout=10):
 
 def wait_window_and_close(title, timeout=10):
     candidates = [title] + [t for t in ["設定", "Windows 設定", "Settings"] if t != title]
-    for _ in range(timeout * 10):
-        for t in candidates:
-            hwnd = win32gui.FindWindow(None, t)
-            if hwnd:
-                run_silent(["taskkill", "/im", "systemsettings.exe", "/f"])
-                return
-        time.sleep(0.1)
+    def _find():
+        return any(win32gui.FindWindow(None, t) for t in candidates)
+    if _wait_until(_find, timeout=timeout):
+        run_quiet(["taskkill", "/im", "systemsettings.exe", "/f"])
 
-# ── 系統設定 ──────────────────────────────────────────
+# ── 系統設定最佳化 ────────────────────────────────────
 def apply_system_settings():
+    """執行系統設定優化，包含電源管理、防火牆關閉及清除預設排程任務"""
     system_cmds = [
         ["powercfg", "/x", "monitor-timeout-ac",  "15"],
         ["powercfg", "/x", "-disk-timeout-ac",    "0"],
@@ -439,7 +463,7 @@ def apply_system_settings():
         ["winget", "uninstall", "--id", "Microsoft.OneDrive", "--silent", "--accept-source-agreements"],
     ]
     for cmd in system_cmds:
-        run_silent(cmd)
+        run_quiet(cmd)
 
     for svc in ["CscService", "DusmSvc", "Spooler"]:
         sc_disable_retry(svc)
@@ -456,35 +480,39 @@ def apply_system_settings():
 
 def _write_failure_log(install_mode, plugin_dir, bg_names=None):
     """
-    最終反向比對驗證。
-    winget 驗證清單從 core/winget.txt 讀取，若有外掛也讀 xxx/winget.txt。
+    執行安裝最終的健康度與狀態驗證，並匯出執行 Log。
+    平行檢查 winget 套件安裝狀態，比對服務狀態與必要檔案。
     """
     if not LOG_PATH:
         return
 
-    verifyFAILURES = []
-
-    # ── 反向比對：winget 套件（從 txt 動態讀取）────────
     check_pkgs = _parse_winget_txt(CORE_WINGET)
     if plugin_dir:
         check_pkgs += _parse_winget_txt(os.path.join(plugin_dir, "winget.txt"))
 
-    for pkg_id, *_ in check_pkgs:
+    def _verify_pkg(pkg_id):
         try:
             r = subprocess.run(
                 ["winget", "list", "--id", pkg_id, "--exact"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             if r.returncode != 0:
-                verifyFAILURES.append(("Verify-Package", pkg_id, "winget list --id 未偵測到"))
+                return ("--:--:--", "Verify-Package", pkg_id, "winget list --id 未偵測到")
         except Exception as e:
-            verifyFAILURES.append(("Verify-Package", pkg_id, str(e)))
+            return ("--:--:--", "Verify-Package", pkg_id, str(e))
+        return None
+
+    pkg_ids = [p for p, *_ in check_pkgs]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        verify_results = list(ex.map(_verify_pkg, pkg_ids))
+
+    verifyFAILURES = [r for r in verify_results if r is not None]
 
     mpv_path = os.path.join(PROGRAMFILES, "mpv_PlayKit", "mpv.exe")
     if not os.path.exists(mpv_path):
-        verifyFAILURES.append(("Verify-Package", "mpv_PlayKit", "mpv.exe 不存在"))
+        verifyFAILURES.append(("--:--:--", "Verify-Package", "mpv_PlayKit", "mpv.exe 不存在"))
 
-    # ── 反向比對：服務狀態 ────────────────────────────
+    # 反向比對：服務狀態
     for svc in ["CscService", "DusmSvc", "Spooler"]:
         try:
             r = subprocess.run(["sc", "qc", svc],
@@ -492,14 +520,14 @@ def _write_failure_log(install_mode, plugin_dir, bg_names=None):
             out = r.stdout.decode("cp950", errors="replace")
             start_lines = [l for l in out.splitlines() if "START_TYPE" in l]
             if start_lines and "DISABLED" not in start_lines[0].upper():
-                verifyFAILURES.append(("Verify-Service", svc, start_lines[0].strip()))
+                verifyFAILURES.append(("--:--:--", "Verify-Service", svc, start_lines[0].strip()))
         except Exception as e:
-            verifyFAILURES.append(("Verify-Service", svc, str(e)))
+            verifyFAILURES.append(("--:--:--", "Verify-Service", svc, str(e)))
 
     runtime_labels = {f[2] for f in FAILURES}
     finalFAILURES = [
-        ("--:--:--", cat, label, detail)
-        for cat, label, detail in verifyFAILURES
+        (ts, cat, label, detail)
+        for ts, cat, label, detail in verifyFAILURES
         if label not in runtime_labels
     ]
 
@@ -538,12 +566,9 @@ def _write_failure_log(install_mode, plugin_dir, bg_names=None):
     except Exception as e:
         print(f"Log 寫入失敗: {e}\n")
 
-# ── 主選單 ────────────────────────────────────────────
+# ── 介面與流程控制 ────────────────────────────────────
 def _print_confirm_base(pc_input, pc_name, install_mode, crack_label):
-    os.system("cls")
-    print(PROGRAM_NAME)
-    print(f"PC-NAME: {pc_name}")
-    print()
+    _print_header()
     if pc_input:
         print(f"PC-NAME(NEW): {pc_input}")
     print(install_mode)
@@ -564,15 +589,8 @@ def menu():
             continue
         options[choice][1]()
 
-# ── install 問卷 ──────────────────────────────────────
 def _collect_install_options():
-    """
-    問卷順序：
-      電腦名稱
-      → [若有外掛] xxx Mode? Y/N
-      → Crack Activation? Y/N
-      → DATA Restore? Y/N
-    """
+    """收集使用者部署資訊"""
     _print_header()
     pc_input = input("請輸入電腦名稱: ").strip()
 
@@ -581,7 +599,7 @@ def _collect_install_options():
     plugin_dir   = None
 
     if PLUGINS:
-        # 只取第一個偵測到的外掛（多外掛不做防呆）
+        # 僅取第一個偵測到的外掛（目前不支援多外掛防呆）
         mode_name, (mod, p_dir) = next(iter(PLUGINS.items()))
         ans = input(f"{mode_name}? (輸入Y/N繼續): ").upper()
         if ans == "Y":
@@ -595,10 +613,42 @@ def _collect_install_options():
 
     return pc_input, pc_name, install_mode, crack, do_restore, plugin_mod, plugin_dir
 
-# ── install ───────────────────────────────────────────
+def _resolve_restore_dir() -> str | None:
+    """自動偵測還原備份資料夾（D槽為主），允許使用者手動輸入，回傳目錄路徑或取消(None)"""
+    auto_found = None
+    try:
+        for entry in os.listdir("D:\\"):
+            if entry.lower().startswith("backup_") and os.path.isdir(f"D:\\{entry}"):
+                candidate_path = f"D:\\{entry}"
+                if any(os.path.isdir(os.path.join(candidate_path, l)) for l in _BACKUP_LABELS):
+                    auto_found = candidate_path
+                    break
+    except Exception:
+        pass
+
+    candidate = auto_found
+    while True:
+        if candidate and os.path.isdir(candidate):
+            sub_items = [l for l in _BACKUP_LABELS if os.path.isdir(os.path.join(candidate, l))]
+            sub_label = "/".join(sub_items) if sub_items else ""
+            print(f"\n備份來源：{candidate}  [{sub_label}]")
+            if input("備份檔案所在資料夾正確嗎? (輸入Y/N繼續): ").upper() == "Y":
+                return candidate
+            candidate = None
+        else:
+            path_input = input("\n請輸入備份檔案所在資料夾(輸入N回主選單):").strip()
+            if path_input.upper() == "N":
+                return None
+            if not os.path.isdir(path_input):
+                print("路徑不存在，請重新輸入")
+                continue
+            if not any(os.path.isdir(os.path.join(path_input, l)) for l in _BACKUP_LABELS):
+                print("資料夾無備份檔案，請重新輸入")
+                continue
+            candidate = path_input
+
 def install():
-    pc_input, pc_name, install_mode, crack, do_restore, plugin_mod, plugin_dir = \
-        _collect_install_options()
+    pc_input, pc_name, install_mode, crack, do_restore, plugin_mod, plugin_dir = _collect_install_options()
     crack_label = "Crack Activation" if crack else "Do not Crack Activation"
 
     def _show_confirm(restore_label):
@@ -609,61 +659,24 @@ def install():
 
     if not do_restore:
         _show_confirm("Do not DATA Restore\n")
-        confirm = input("Provision Are you sure? (輸入Y/N繼續): ").upper()
-        if confirm != "Y":
+        if input("Provision Are you sure? (輸入Y/N繼續): ").upper() != "Y":
             return
         _show_confirm("Do not DATA Restore\n")
     else:
-        auto_found = None
-        try:
-            for entry in os.listdir("D:\\"):
-                if entry.lower().startswith("backup_") and os.path.isdir(f"D:\\{entry}"):
-                    candidate_path = f"D:\\{entry}"
-                    if any(os.path.isdir(os.path.join(candidate_path, l)) for l in _BACKUP_LABELS):
-                        auto_found = candidate_path
-                        break
-        except Exception:
-            pass
-
-        candidate = auto_found
-
-        while True:
-            if candidate and os.path.isdir(candidate):
-                sub_items = [l for l in _BACKUP_LABELS
-                             if os.path.isdir(os.path.join(candidate, l))]
-                sub_label = "/".join(sub_items) if sub_items else ""
-                restore_label = f"還原資料:{sub_label}\n備份檔案所在資料夾: {candidate}\n"
-                _show_confirm(restore_label)
-                ok = input("備份檔案所在資料夾正確嗎? (輸入Y/N繼續): ").upper()
-                if ok == "Y":
-                    restore_dir = candidate
-                    confirm = input("Provision Are you sure? (輸入Y/N繼續): ").upper()
-                    if confirm != "Y":
-                        return
-                    os.system("cls")
-                    _show_confirm(restore_label)
-                    break
-                else:
-                    candidate = None
-            else:
-                path_input = input("\n請輸入備份檔案所在資料夾(輸入N回主選單):").strip()
-                if path_input.upper() == "N":
-                    return
-                if not os.path.isdir(path_input):
-                    print("路徑不存在，請重新輸入")
-                    continue
-                has_backup = any(
-                    os.path.isdir(os.path.join(path_input, label))
-                    for label in _BACKUP_LABELS
-                )
-                if not has_backup:
-                    print("資料夾無備份檔案，請重新輸入")
-                    continue
-                candidate = path_input
+        restore_dir = _resolve_restore_dir()
+        if restore_dir is None:
+            return
+        sub_items = [l for l in _BACKUP_LABELS if os.path.isdir(os.path.join(restore_dir, l))]
+        restore_label = f"還原資料:{'/'.join(sub_items)}\n備份檔案所在資料夾: {restore_dir}\n"
+        _show_confirm(restore_label)
+        if input("Provision Are you sure? (輸入Y/N繼續): ").upper() != "Y":
+            return
+        os.system("cls")
+        _show_confirm(restore_label)
 
     _run_install(pc_input, pc_name, install_mode, crack, restore_dir, plugin_mod, plugin_dir)
 
-# ── Install Phases ────────────────────────────────────
+# ── 部署階段 (Install Phases) ─────────────────────────
 def _phase_restore(restore_dir):
     if not restore_dir:
         return
@@ -701,11 +714,7 @@ def _phase_office():
         print("Office 掛載失敗")
         return None, None
     setup_exe = f"{drive}:\\Setup.exe"
-    for _ in range(50):
-        if os.path.exists(setup_exe):
-            break
-        time.sleep(0.1)
-    if not os.path.exists(setup_exe):
+    if not _wait_until(lambda: os.path.exists(setup_exe), timeout=5):
         print("Office 找不到 Setup.exe")
         return None, None
     print("安裝 Office...")
@@ -713,16 +722,16 @@ def _phase_office():
     return img_path, office_proc
 
 def _phase_office_cleanup(img_path, office_proc):
-    if office_proc is not None or img_path:
-        run_silent(["taskkill", "/f", "/im", "OfficeC2RClient.exe"])
+    if office_proc is not None:
+        run_quiet(["taskkill", "/f", "/im", "OfficeC2RClient.exe"])
     if img_path:
-        run_silent(["powershell", "-Command",
+        run_quiet(["powershell", "-Command",
                     f"Dismount-DiskImage -ImagePath '{img_path}'"])
 
-def _phase_git():
+def _phase_git(retry_queue):
     global _GIT_EXE_CACHE
     print("安裝 Git...")
-    winget_install_pkg("Git.Git", exact=False, source="winget")
+    winget_install_pkg("Git.Git", exact=False, source="winget", _retry_queue=retry_queue)
     os.system("COLOR 0B")
     for _ in range(5):
         _GIT_EXE_CACHE = None
@@ -733,8 +742,10 @@ def _phase_git():
 
 def _phase_files(plugin_mod):
     """
-    [共同] 字型 / themes / windir
-    [外掛] 呼叫 plugin_mod.custom_files()  ← api1
+    部署自訂檔案：
+    1. 安裝核心字型。
+    2. 複製核心佈景主題與 Windows 自定義檔案。
+    3. 若有載入擴充外掛，則觸發外掛專屬的 custom_files() 流程。
     """
     themes_dst = os.path.join(WINDIR, "Resources", "Themes")
     install_fonts(CORE_FONTS)
@@ -760,7 +771,7 @@ def _phase_mpv():
             )
         if r_git.returncode != 0:
             raise RuntimeError(f"git 失敗 returncode={r_git.returncode}")
-        _fix_acl(mpv_dst)
+        fix_acl(mpv_dst)
         mpv_com = os.path.join(mpv_dst, "mpv.com")
         subprocess.run([mpv_com, "--config=no", "--register"])
         mpv_exe  = os.path.join(mpv_dst, "mpv.exe")
@@ -771,33 +782,35 @@ def _phase_mpv():
             f'$s.WorkingDirectory="{mpv_dst}";'
             f'$s.Save()'
         )
-        run_silent(["powershell", "-Command", ps])
+        run_quiet(["powershell", "-Command", ps])
         os.system("COLOR 0B")
     except Exception as e:
         print(f"mpv_PlayKit 失敗: {e}")
         error("Installer", "mpv_PlayKit", str(e))
 
-def _install_winget_list(path):
+def _install_winget_list(path, retry_queue):
     for pkg_id, exact, source, display_name in _parse_winget_txt(path):
         _name = display_name or (pkg_id.split(".", 1)[1] if "." in pkg_id else pkg_id)
         print(f"\n安裝 {_name}...")
-        winget_install_pkg(pkg_id, exact=exact, source=source)
+        winget_install_pkg(pkg_id, exact=exact, source=source, _retry_queue=retry_queue)
         os.system("COLOR 0B")
 
-def _phase_winget(plugin_dir):
+def _phase_winget(plugin_dir, retry_queue):
     """
-    [共同] 讀 core/winget.txt 安裝
-    [外掛] 讀 xxx/winget.txt 安裝  ← api2
+    透過 winget 安裝軟體：
+    1. 讀取並安裝核心 core/winget.txt 清單。
+    2. 若有載入外掛，則接續安裝外掛專屬的 winget.txt。
     """
-    _install_winget_list(CORE_WINGET)
+    _install_winget_list(CORE_WINGET, retry_queue)
     if plugin_dir:
-        _install_winget_list(os.path.join(plugin_dir, "winget.txt"))
+        _install_winget_list(os.path.join(plugin_dir, "winget.txt"), retry_queue)
 
 def _phase_system(install_mode, plugin_dir, pc_input):
     """
-    [共同疊加] core/reg/*.reg
-    [互斥]     Normal → core/*.reg  /  xxx Mode → xxx/*.reg
-    [共同]     apply_system_settings / 電腦名稱
+    匯入系統登錄檔與基礎設定：
+    1. 疊加核心的 core/reg/*.reg。
+    2. 根據是否掛載外掛，匯入根目錄或外掛目錄下的 .reg 檔。
+    3. 套用系統優化及重命名電腦名稱。
     """
     import_reg_dir(CORE_REG_DIR)
     if plugin_dir:
@@ -887,7 +900,7 @@ def _phase_theme(themes_dst):
     iconcache = os.path.join(LOCAL_APPDATA, "iconcache.db")
     if os.path.exists(iconcache):
         try:
-            run_silent(["attrib", "-s", "-r", "-h", iconcache])
+            run_quiet(["attrib", "-s", "-r", "-h", iconcache])
             os.chmod(iconcache, stat.S_IWRITE)
             os.remove(iconcache)
         except Exception as e:
@@ -897,8 +910,9 @@ def _phase_theme(themes_dst):
 
 def _phase_setup(plugin_mod):
     """
-    [共同] core/setup/*.exe 背景執行
-    [外掛] 呼叫 plugin_mod.custom_setup()  ← api3
+    觸發各類安裝執行檔 (Setup):
+    1. 將 core/setup 內的所有 .exe 置入背景靜默執行。
+    2. 若有載入外掛，則觸發外掛自定義的 custom_setup() 流程。
     """
     _bg_names = []
     for f in safe_listdir(CORE_SETUP):
@@ -912,22 +926,21 @@ def _phase_setup(plugin_mod):
             _bg_names.extend(plugin_bg)
     return _bg_names
 
-# ── _run_install ──────────────────────────────────────
 def _run_install(pc_input, pc_name, install_mode, crack, restore_dir, plugin_mod, plugin_dir):
-    global LOG_PATH, pending_final_retry
+    global LOG_PATH
     FAILURES.clear()
-    pending_final_retry = []
+    retry_queue = []
     ts = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
     LOG_PATH = os.path.join(DESKTOP, f"{PROGRAM_NAME}_Log_{ts}.txt")
     _maximize_console()
 
     _phase_restore(restore_dir)
     img_path, office_proc = _phase_office()
-    _phase_git()
+    _phase_git(retry_queue)
     themes_dst = _phase_files(plugin_mod)
     _phase_mpv()
     _phase_office_cleanup(img_path, office_proc)
-    _phase_winget(plugin_dir)
+    _phase_winget(plugin_dir, retry_queue)
     _phase_system(install_mode, plugin_dir, pc_input)
     set_best_appearance()
     _release_topmost()
@@ -936,12 +949,12 @@ def _run_install(pc_input, pc_name, install_mode, crack, restore_dir, plugin_mod
     _phase_theme(themes_dst)
     _bg_names = _phase_setup(plugin_mod)
 
-    _final_retry_installers()
+    _final_retry_installers(retry_queue)
     _write_failure_log(install_mode, plugin_dir, _bg_names)
     sc_disable_retry("CryptSvc")
     os.system("pause")
 
-# ── data_backup ───────────────────────────────────────
+# ── 資料備份作業 ──────────────────────────────────────
 def data_backup():
     anydesk_src = os.path.join(PROGRAM_DATA, "AnyDesk")
 
@@ -962,9 +975,10 @@ def data_backup():
         if quit_key in choice:
             return
 
-        selected = []
+        # 過濾空白字元避免輸入誤判，並濾除重複的選擇
         seen = set()
-        for ch in choice:
+        selected = []
+        for ch in choice.replace(" ", ""):
             if ch not in seen and ch in backup_options and ch != quit_key:
                 seen.add(ch)
                 selected.append((ch, backup_options[ch]))
@@ -991,7 +1005,7 @@ def data_backup():
                 continue
             dst = os.path.join(backup_root, label)
             print(f"\n備份{label}...")
-            _robocopy(src, dst)
+            robocopy(src, dst)
 
         print(f"\n{labels} 備份完成")
         os.system("pause")

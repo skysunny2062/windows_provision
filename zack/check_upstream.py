@@ -1,30 +1,57 @@
 """
 check_upstream.py 
 監控上游負責的「所有」設定項目，以及 Zack Provision 所做的系統設定值
-用途：上游更新後跑一次，確認這些項目是否仍由上游正確處理
-    若出現 ✗ 代表上游不再負責該項，考慮加回自己的 code
+
+用途：
+  上游更新後執行一次，確認這些項目是否仍由上游正確處理。
+  若出現 ✗ 代表上游不再負責該項，需考慮加回自定義的腳本中。
 
 監控邏輯：
-  【上游環境設定值】上游有做的項目  →  確保上游持續處理
-  【Zack 設定值】   Zack Provision 做的系統設定  →  確認部署結果正確
+  【上游環境設定值】確保上游有做的項目持續生效。
+  【Zack 設定值】確認 Zack Provision 部署的系統設定結果是否正確。
 """
-import datetime, os, socket, subprocess, winreg
+import datetime
+import os
+import socket
+import subprocess
+import winreg
 
 OUT_DIR  = os.path.join(os.environ["USERPROFILE"], "Desktop")
 TS       = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
 OUT_FILE = os.path.join(OUT_DIR, f"check_upstream_{TS}.txt")
-LINES    = []
+
+# 將輸出結果分段收集（上游與 Zack），最後再合併統計，避免依賴掃描輸出字串來判斷歸屬
+_upstream_lines: list[str] = []
+_zack_lines: list[str]     = []
+_header_lines: list[str]   = []
+_current_lines: list[str]  = _header_lines  # 指向當前準備寫入的目標段落
+
+def _switch_to_upstream():
+    """切換輸出目標至上游段落"""
+    global _current_lines
+    _current_lines = _upstream_lines
+
+def _switch_to_zack():
+    """切換輸出目標至 Zack 段落"""
+    global _current_lines
+    _current_lines = _zack_lines
 
 def w(*args):
-    LINES.append(" ".join(str(a) for a in args))
+    """將內容寫入當前指定的輸出段落中"""
+    _current_lines.append(" ".join(str(a) for a in args))
 
 def section(title):
+    """輸出區塊分隔線與標題"""
     w("")
     w("=" * 60)
     w(f"  {title}")
     w("=" * 60)
 
 def run_out(cmd):
+    """
+    執行系統指令並回傳標準輸出 (stdout)。
+    會自動嘗試多種編碼以防亂碼。
+    """
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         for enc in ("utf-8", "cp950", "cp1252"):
@@ -37,6 +64,7 @@ def run_out(cmd):
         return f"ERROR({e})"
 
 def reg_get(hive, key, name):
+    """安全讀取登錄檔鍵值，若不存在或發生錯誤則回傳對應的狀態字串。"""
     try:
         with winreg.OpenKey(hive, key, 0, winreg.KEY_READ) as k:
             val, _ = winreg.QueryValueEx(k, name)
@@ -47,7 +75,7 @@ def reg_get(hive, key, name):
         return f"ERROR({e})"
 
 def reg_key_deleted(hive, key):
-    """確認某個 key 已被刪除"""
+    """檢查指定的登錄檔 Key 是否已被刪除。"""
     try:
         winreg.OpenKey(hive, key)
         return False  # 還存在
@@ -60,17 +88,20 @@ HKLM = winreg.HKEY_LOCAL_MACHINE
 HKCU = winreg.HKEY_CURRENT_USER
 
 def show(label, hive, key, name, expect):
+    """比對登錄檔實際值與預期值，並輸出 ✓ 或 ✗ 結果。"""
     val = reg_get(hive, key, name)
     ok  = str(val) == str(expect)
     mark = "✓" if ok else "✗"
     w(f"  {label:<55} = {str(val):<20} [={expect}] {mark}")
 
 def show_deleted(label, hive, key):
+    """檢查登錄檔 Key 是否如預期般被刪除，並輸出 ✓ 或 ✗ 結果。"""
     deleted = reg_key_deleted(hive, key)
     mark = "✓" if deleted else "✗"
     w(f"  {label:<55}   {'DELETED' if deleted else 'EXISTS'} {mark}")
 
 def show_svc(name, expect="disabled"):
+    """比對系統服務的啟動狀態與預期值，並輸出 ✓ 或 ✗ 結果。"""
     val = svc_start(name)
     val_up = val.upper()
     if expect == "disabled":
@@ -85,6 +116,7 @@ def show_svc(name, expect="disabled"):
     w(f"  {name:<35} {val:<25} [={expect}] {mark}")
 
 def svc_start(name):
+    """使用 sc qc 指令獲取服務的啟動類型 (START_TYPE)。"""
     out = run_out(["sc", "qc", name])
     if "1060" in out or "does not exist" in out.lower() or "找不到" in out:
         return "NOT_INSTALLED"
@@ -94,27 +126,8 @@ def svc_start(name):
             return f"{parts[2]} {parts[3]}" if len(parts) >= 4 else "UNKNOWN"
     return "UNKNOWN"
 
-def powercfg_standby_ac():
-    """從 Registry 直接讀取當前電源計劃的 AC 待機逾時（秒），避免 powercfg 指令在 Administrator 環境讀取失敗"""
-    try:
-        # 先取得當前啟用的電源計劃 GUID
-        with winreg.OpenKey(HKLM,
-                r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes") as k:
-            active_guid, _ = winreg.QueryValueEx(k, "ActivePowerScheme")
-        # 待機 AC 設定路徑
-        sleep_key = (
-            f"SYSTEM\\CurrentControlSet\\Control\\Power\\User\\PowerSchemes\\"
-            f"{active_guid}\\238c9fa8-0aad-41ed-83f4-97be242c8f20\\"
-            f"29f6c1db-86da-48c5-9fdb-f2b67b1f44da"
-        )
-        with winreg.OpenKey(HKLM, sleep_key) as k:
-            val, _ = winreg.QueryValueEx(k, "ACSettingIndex")
-            return int(val)
-    except Exception:
-        return None
-
 def show_svchost_mitigation():
-    """EnableSvchostMitigationPolicy 是 REG_QWORD，值為 0 即可"""
+    """檢查 SvcHost Mitigation 政策是否停用 (EnableSvchostMitigationPolicy=0)。"""
     val = reg_get(HKLM, r"SYSTEM\CurrentControlSet\Control\SCMConfig", "EnableSvchostMitigationPolicy")
     if val == "KEY_NOT_FOUND":
         ok = True   # key 不存在視為已停用
@@ -125,9 +138,26 @@ def show_svchost_mitigation():
     mark = "✓" if ok else "✗"
     w(f"  {'SvcHostMitigationPolicy':<55} = {str(val):<20} [=0] {mark}")
 
+def _powercfg_ac(sub_guid, setting_guid, label, expect):
+    """檢查電源計畫中 AC 電源（插電狀態）的特定逾時時間設定。"""
+    try:
+        with winreg.OpenKey(HKLM,
+                r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes") as k:
+            active, _ = winreg.QueryValueEx(k, "ActivePowerScheme")
+        key = (f"SYSTEM\\CurrentControlSet\\Control\\Power\\User\\PowerSchemes\\"
+               f"{active}\\{sub_guid}\\{setting_guid}")
+        with winreg.OpenKey(HKLM, key) as k:
+            val, _ = winreg.QueryValueEx(k, "ACSettingIndex")
+            ok = int(val) == expect
+            w(f"  {label:<55} = {val:<20} [={expect}] {'✓' if ok else '✗'}")
+    except Exception as e:
+        w(f"  {label:<55} 讀取失敗: {e}")
+
 # ════════════════════════════════════════════════════════════
 # OEM 環境判斷
+# ════════════════════════════════════════════════════════════
 def _get_oem_model():
+    """取得系統 OEM 資訊，用以判斷是否已經過 Zack 部署。"""
     try:
         with winreg.OpenKey(HKLM,
                 r"SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation") as k:
@@ -137,10 +167,7 @@ def _get_oem_model():
         return ""
 
 _oem = _get_oem_model()
-if "Zack" in _oem:
-    _env_label = f"環境:{_oem}"
-else:
-    _env_label = "環境:未使用過Zack-Provision"
+_env_label = f"環境:{_oem}" if "Zack" in _oem else "環境:未使用過Zack-Provision"
 
 w(f"check_upstream v9  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 w(f"PC: {socket.gethostname()}   User: {os.environ.get('USERNAME','')}   {_env_label}")
@@ -151,6 +178,7 @@ w("  【Zack 設定值】  監控 Zack Provision 所做的系統設定")
 # ══════════════════════════════════════════════════════════════════
 # ▌上游環境設定值
 # ══════════════════════════════════════════════════════════════════
+_switch_to_upstream()
 
 # ──────────────────────────────────────────────────────────
 section("【上游】服務停用（SetupComplete.cmd）")
@@ -198,12 +226,9 @@ for svc in ["PlutonHsp2","PlutonHeci","Hsp"]:
 # ──────────────────────────────────────────────────────────
 section("【上游】電源（SetupComplete.cmd）")
 # ──────────────────────────────────────────────────────────
-ac_secs = powercfg_standby_ac()
-if ac_secs is None:
-    w("  待機 AC 逾時                                               讀取失敗")
-else:
-    ok = ac_secs == 0
-    w(f"  {'待機 AC 逾時':<55} = {ac_secs}秒 [=0] {'✓' if ok else '✗'}")
+_powercfg_ac("238c9fa8-0aad-41ed-83f4-97be242c8f20",
+             "29f6c1db-86da-48c5-9fdb-f2b67b1f44da",
+             "待機 AC 逾時", 0)
 
 # ──────────────────────────────────────────────────────────
 section("【上游】安全性 UAC / VBS / LSA")
@@ -298,8 +323,8 @@ _tp_ok = _tp in (0, "KEY_NOT_FOUND")
 w(f"  {'TamperProtection':<55} = {str(_tp):<20} [=0/KEY_NOT_FOUND] {'✓' if _tp_ok else '✗'}")
 w("  ※ TamperProtection=1：WinDefend 服務鍵殘留時 Windows 自動寫回，驅動已刪無實際效力")
 
-# DefenderApiLogger / DefenderAuditLogger：上游 RemovalofWindowsDefenderAntivirus.reg 整個刪 key
-# → 正常部署後 key 不存在（KEY_NOT_FOUND），始祖級機器因舊 code 未執行故 key 仍存在
+# DefenderApiLogger / DefenderAuditLogger：上游 RemovalofWindowsDefenderAntivirus.reg 整個刪除 key
+# 正常部署後 key 應不存在（KEY_NOT_FOUND），部分舊設備若未執行則 key 會存在
 for _logger, _key in [
     ("DefenderApiLogger Start",  r"SYSTEM\CurrentControlSet\Control\WMI\Autologger\DefenderApiLogger"),
     ("DefenderAuditLogger Start", r"SYSTEM\CurrentControlSet\Control\WMI\Autologger\DefenderAuditLogger"),
@@ -308,8 +333,8 @@ for _logger, _key in [
     _ok = _v == "KEY_NOT_FOUND" or _v == 0
     w(f"  {_logger:<55} = {str(_v):<20} [=0/KEY_NOT_FOUND] {'✓' if _ok else '✗'}")
 
-# WdBoot/WdFilter/WdNisDrv/WdNisSvc/WinDefend：服務鍵殘留（Windows 保護無法刪），
-# Start 值殘留非 4；驅動實體已刪，無實際效力。期望 key 被刪（KEY_NOT_FOUND）或 Start=4
+# Defender 相關服務：因 Windows 保護導致服務鍵無法完全刪除，Start 值殘留。
+# 但驅動實體已刪，無實際效力。預期狀態為 KEY_NOT_FOUND 或 Start=4 (停用)
 w("  ※ WdXxx/WinDefend Start：服務鍵 Windows 保護無法刪，驅動實體已刪，Start 殘留值無實際效力")
 for _svcname, _key in [
     ("WdBoot Start",    r"SYSTEM\CurrentControlSet\Services\WdBoot"),
@@ -445,7 +470,7 @@ show_svc("Spooler", "disabled")
 _pn_val = svc_start("PrintNotify")
 _pn_ok  = "DEMAND" in _pn_val.upper() or "AUTO" in _pn_val.upper() or "NOT_INSTALLED" in _pn_val.upper()
 w(f"  {'PrintNotify':<35} {_pn_val:<25} [=demand] {'✓' if _pn_ok else '✗'}")
-# Browser 是 demand start
+# Browser 預設為 demand 啟動
 _browser_val = svc_start("Browser")
 _browser_ok  = "DEMAND" in _browser_val.upper() or "NOT_INSTALLED" in _browser_val.upper()
 w(f"  {'Browser':<35} {_browser_val:<25} [=demand] {'✓' if _browser_ok else '✗'}")
@@ -478,6 +503,7 @@ show_deleted("DefenderAuditLogger Autologger",HKLM, r"SYSTEM\CurrentControlSet\C
 # ════════════════════════════════════════════════════════════════════
 # ▌Zack 設定值
 # ════════════════════════════════════════════════════════════════════
+_switch_to_zack()
 
 # ──────────────────────────────────────────────────────────
 section("【Zack】工作列")
@@ -500,8 +526,7 @@ _ctx_val = reg_get(HKCU, _ctx, "")
 _ctx_ok  = _ctx_val == "" or _ctx_val == "KEY_NOT_FOUND"
 w(f"  {'Win10 舊式右鍵選單（InprocServer32 預設值）':<55} = {str(_ctx_val):<20} [=] {'✓' if _ctx_ok else '✗'}")
 
-import os as _os
-_windir = _os.environ.get("windir", r"C:\Windows")
+_windir = os.environ.get("windir", r"C:\Windows")
 _shell_icons_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons"
 _expected_icon = f"{_windir}\\system32\\imageres.dll,197"
 show("Shell Icons 29（資料夾圖示）", HKLM, _shell_icons_key, "29", _expected_icon)
@@ -520,20 +545,6 @@ show("Power ACSettingIndex（僅螢幕）",  HKLM,
 # ──────────────────────────────────────────────────────────
 section("【Zack】電源逾時（powercfg）")
 # ──────────────────────────────────────────────────────────
-def _powercfg_ac(sub_guid, setting_guid, label, expect):
-    try:
-        with winreg.OpenKey(HKLM,
-                r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes") as k:
-            active, _ = winreg.QueryValueEx(k, "ActivePowerScheme")
-        key = (f"SYSTEM\\CurrentControlSet\\Control\\Power\\User\\PowerSchemes\\"
-               f"{active}\\{sub_guid}\\{setting_guid}")
-        with winreg.OpenKey(HKLM, key) as k:
-            val, _ = winreg.QueryValueEx(k, "ACSettingIndex")
-            ok = int(val) == expect
-            w(f"  {label:<55} = {val:<20} [={expect}] {'✓' if ok else '✗'}")
-    except Exception as e:
-        w(f"  {label:<55} 讀取失敗: {e}")
-
 # 螢幕逾時 AC = 900 秒（15 分鐘）
 _powercfg_ac("7516b95f-f776-4464-8c53-06167f40cc99",
              "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e",
@@ -591,8 +602,8 @@ for svc in ["CscService", "DusmSvc", "Spooler"]:
 # ──────────────────────────────────────────────────────────
 section("【Zack】系統指令結果")
 # ──────────────────────────────────────────────────────────
-# 防火牆
 def _fw_state():
+    """檢查所有防火牆設定檔狀態是否皆為關閉"""
     out = run_out(["netsh", "advfirewall", "show", "allprofiles", "state"])
     lines = [l.strip() for l in out.splitlines() if "State" in l or "狀態" in l]
     on_count = sum(1 for l in lines if "ON" in l.upper() or "開啟" in l)
@@ -601,27 +612,25 @@ def _fw_state():
 _fw_ok, _fw_detail = _fw_state()
 w(f"  {'防火牆（全部關閉）':<55} {'✓' if _fw_ok else '✗  ' + _fw_detail}")
 
-# 磁碟重組排程
+# 檢查磁碟重組排程狀態
 _defrag_out = run_out(["schtasks", "/query", "/tn",
                        r"\Microsoft\Windows\Defrag\ScheduledDefrag", "/fo", "LIST"])
 _defrag_disabled = "Disabled" in _defrag_out or "停用" in _defrag_out
 w(f"  {'磁碟重組排程（Disabled）':<55} {'✓' if _defrag_disabled else '✗'}")
 
-# 系統還原
-_sr_out = run_out(["powershell", "-Command",
-                   "Get-ComputerRestorePoint -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count"])
+# 檢查系統還原是否停用
 _sr_val = reg_get(HKLM,
     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore", "RPSessionInterval")
 _sr_disabled = str(_sr_val) in ("0", "KEY_NOT_FOUND")
 w(f"  {'系統還原停用（RPSessionInterval=0）':<55} = {str(_sr_val):<20} [=0/KEY_NOT_FOUND] {'✓' if _sr_disabled else '✗'}")
 
-# OEM Model
+# 檢查 OEM Model 標籤
 _oem_model = reg_get(HKLM,
     r"SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation", "Model")
 _oem_ok = isinstance(_oem_model, str) and "Zack Provision" in _oem_model
 w(f"  {'OEM Model（含 Zack Provision）':<55} = {str(_oem_model):<20} {'✓' if _oem_ok else '✗'}")
 
-# BCD 開機逾時
+# 檢查 BCD 開機選單逾時
 _bcd_out = run_out(["bcdedit", "/enum", "{bootmgr}"])
 _bcd_timeout_ok = "timeout" in _bcd_out.lower() and any(
     ("timeout" in l.lower() and "0" in l)
@@ -630,33 +639,27 @@ _bcd_timeout_ok = "timeout" in _bcd_out.lower() and any(
 w(f"  {'BCD bootmgr timeout（=0）':<55} {'✓' if _bcd_timeout_ok else '✗'}")
 
 # ════════════════════════════════════════════════════════════════════
-w("")
-w("=" * 60)
-fail_count = sum(1 for l in LINES if "✗" in l)
+# 合併並統計輸出結果
+# 從各段 list 直接計算失敗數量，避免依賴文字掃描造成誤判
+# ════════════════════════════════════════════════════════════════════
+_upstream_fail = sum(1 for l in _upstream_lines if "✗" in l)
+_zack_fail     = sum(1 for l in _zack_lines     if "✗" in l)
+_fail_count    = _upstream_fail + _zack_fail
 
-# 判斷屬於哪個大項
-_in_zack = False
-_zack_fail = 0
-_upstream_fail = 0
-for l in LINES:
-    if "▌Zack 設定值" in l:
-        _in_zack = True
-    if "✗" in l:
-        if _in_zack:
-            _zack_fail += 1
-        else:
-            _upstream_fail += 1
+LINES = _header_lines + _upstream_lines + _zack_lines
+LINES.append("")
+LINES.append("=" * 60)
 
-if fail_count == 0:
-    w("  結果：全部正常 ✓")
+if _fail_count == 0:
+    LINES.append("  結果：全部正常 ✓")
 else:
     parts = []
     if _upstream_fail:
         parts.append(f"上游 {_upstream_fail} 個")
     if _zack_fail:
         parts.append(f"Zack {_zack_fail} 個")
-    w(f"  結果：{' / '.join(parts)} 需要確認 ✗（共 {fail_count} 個）")
-w("=" * 60)
+    LINES.append(f"  結果：{' / '.join(parts)} 需要確認 ✗（共 {_fail_count} 個）")
+LINES.append("=" * 60)
 
 os.makedirs(OUT_DIR, exist_ok=True)
 with open(OUT_FILE, "w", encoding="utf-8") as f:
