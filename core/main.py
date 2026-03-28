@@ -134,7 +134,7 @@ def _detect_plugins():
 PLUGINS = _detect_plugins()
 
 # ── winget.txt 解析──────────────────────────────────
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=32)
 def _parse_winget_txt(path):
     """
     解析 winget 清單檔，每行格式支援：pkg_id[,exact][,msstore][,name=顯示名稱]
@@ -851,7 +851,10 @@ def _phase_vcredist():
             if asset["name"].lower() == "visualcppredist_aio_x86_x64.exe":
                 dest = os.path.join(TEMP, asset["name"])
                 if download_file(asset["browser_download_url"], dest):
-                    subprocess.run([dest, "/y"])
+                    try:
+                        subprocess.run([dest, "/y"], timeout=300)
+                    except subprocess.TimeoutExpired:
+                        error("Installer", "VisualCppRedistAIO", "安裝程式 timeout (300s)")
                     os.remove(dest)
                 else:
                     error("Installer", "VisualCppRedistAIO", "下載重試耗盡")

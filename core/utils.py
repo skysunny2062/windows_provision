@@ -61,41 +61,64 @@ def run_quiet(cmd, *, cwd=None, capture=False, **kwargs):
         return None
 
 # ── 檔案系統與 IO 工具 ────────────────────────────────
-def fix_acl(path: str):
-    """重設目標路徑的存取控制清單 (ACL)，並賦予 Administrators 群組完整控制權"""
-    run_quiet(["icacls", path, "/reset", "/t", "/c"])
-    run_quiet(["icacls", path, "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/t", "/c"])
+def fix_acl(path: str, timeout: int = 120) -> bool:
+    """重設目標路徑的存取控制清單 (ACL)，並賦予 Administrators 群組完整控制權，回傳是否成功"""
+    r1 = run_quiet(["icacls", path, "/reset", "/t", "/c"], timeout=timeout)
+    r2 = run_quiet(["icacls", path, "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/t", "/c"], timeout=timeout)
+    return r1 is not None and r2 is not None
 
-def robocopy(src: str, dst: str):
-    """使用 robocopy 進行多執行緒鏡像複製 (支援重試機制)"""
-    r = subprocess.run(["robocopy", src, dst, "/mir", "/mt:8", "/r:10", "/w:3"])
-    # robocopy 結束代碼 >= 8 代表發生嚴重錯誤
-    if r.returncode >= 8:
-        error("IO", f"robocopy {src}", f"returncode={r.returncode}")
+def robocopy(src: str, dst: str, timeout: int = 600) -> bool:
+    """使用 robocopy 進行多執行緒鏡像複製 (支援重試機制)，回傳是否成功"""
+    try:
+        r = subprocess.run(
+            ["robocopy", src, dst, "/mir", "/mt:8", "/r:10", "/w:3"],
+            timeout=timeout
+        )
+        # robocopy 結束代碼 >= 8 代表發生嚴重錯誤
+        if r.returncode >= 8:
+            error("IO", f"robocopy {src}", f"returncode={r.returncode}")
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        error("IO", f"robocopy {src}", f"timeout after {timeout}s")
+        return False
+    except Exception as e:
+        error("IO", f"robocopy {src}", f"unexpected error: {str(e)}")
+        return False
 
-def robocopy_folder(src: str, dst: str):
-    """執行資料夾鏡像複製，並於複製完成後重設目標資料夾的 ACL 權限"""
-    robocopy(src, dst)
+def robocopy_folder(src: str, dst: str) -> bool:
+    """執行資料夾鏡像複製，並於複製完成後重設目標資料夾的 ACL 權限，回傳是否成功"""
+    ok = robocopy(src, dst)
     fix_acl(dst)
+    return ok
 
-def xcopy_folder(src: str, dst: str):
-    """使用 xcopy 複製資料夾內容，並於失敗時記錄錯誤"""
+def xcopy_folder(src: str, dst: str) -> bool:
+    """使用 xcopy 複製資料夾內容，並於失敗時記錄錯誤，回傳是否成功"""
     r = run_quiet(["xcopy", "/s", "/y", src, dst])
     if r and r.returncode not in (0, 1):
         error("IO", f"xcopy {src}", f"returncode={r.returncode}")
+        return False
+    return r is not None
 
-def sync_programfiles(source_dir: str, target_root: str):
+def sync_programfiles(source_dir: str, target_root: str) -> bool:
     """將來源目錄下的所有子資料夾，逐一透過 robocopy 同步至目標根目錄"""
     if not os.path.isdir(source_dir):
-        return
+        return True  # 路徑不存在視為「無需執行=成功」
+    all_ok = True
     for folder in os.listdir(source_dir):
         src = os.path.join(source_dir, folder)
         dst = os.path.join(target_root, folder)
         if os.path.isdir(src):
-            robocopy_folder(src, dst)
+            if not robocopy_folder(src, dst):
+                all_ok = False
+    return all_ok
 
 def safe_listdir(path: str) -> list[str]:
-    """安全讀取目錄內容，若路徑不存在則回傳空列表，避免拋出 FileNotFoundError"""
-    if not os.path.isdir(path):
+    """安全讀取目錄內容，若路徑不存在或無權限則回傳空列表"""
+    try:
+        if not os.path.isdir(path):
+            return []
+        return os.listdir(path)
+    except PermissionError:
+        error("IO", f"safe_listdir {path}", "PermissionError")
         return []
-    return os.listdir(path)

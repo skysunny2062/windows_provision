@@ -80,8 +80,14 @@ def custom_setup() -> list[str]:
     # 處理 Install4j 安裝檔（同步執行，會阻塞主流程直到安裝完成）
     for f in safe_listdir(install4j):
         if f.lower().endswith((".exe", ".msi")):
-            print(f"安裝 {os.path.splitext(f)[0]}...")
-            subprocess.run([os.path.join(install4j, f), "-q"])
+            name = os.path.splitext(f)[0]
+            print(f"安裝 {name}...")
+            try:
+                subprocess.run([os.path.join(install4j, f), "-q"], timeout=300)
+            except subprocess.TimeoutExpired:
+                print(f"安裝 {name} 逾時 (300s)，繼續執行")
+            except Exception as e:
+                print(f"安裝 {name} 失敗：{e}")
 
     # 處理 setup 根目錄的安裝檔（背景靜默執行，不阻塞主流程）
     for f in safe_listdir(setup_dir):
