@@ -30,7 +30,7 @@ Windows 自動化佈署工具，以雙擊 `.bat` 的方式完成全機設定。
 - **資料還原**：自動偵測 `D:\backup_<電腦名稱>` 資料夾，或允許手動輸入路徑；在安裝流程初期即以多個背景視窗平行 `robocopy` 還原各使用者資料夾與 AnyDesk 設定。
 - **資料備份**：獨立於安裝流程的互動式選單，可備份桌面、下載、文件、圖片、音樂、影片、AnyDesk 設定至指定目錄（預設為 `D:\backup_<電腦名稱>`）。
 - **失敗日誌**：安裝結束後自動於桌面產生 `<程式名稱>_Log_<時間戳>.txt`，分兩層記錄：
-  - **verifyFAILURES**（最終確認失敗）：以 `winget list` / `sc qc` 反向比對，確認安裝或服務停用實際未生效的項目。
+  - **verifyFAILURES**（最終確認失敗）：以 `winget list` / `sc qc` 反向比對，確認安裝或服務停用實際未生效的項目。`winget` 驗證採用 `id/name/source` 多重 fallback，降低誤判。
   - **Runtime Warnings**：執行期間捕捉到的例外，retry 後可能已成功，僅供參考。
 - **外掛（Plugin）系統**：偵測根目錄下的子資料夾，若 `<名稱>/<名稱>.py` 存在即載入為外掛。**目前僅支援同時啟用單一外掛**（優先載入第一個偵測到的外掛）。
 
@@ -43,7 +43,9 @@ Windows 自動化佈署工具，以雙擊 `.bat` 的方式完成全機設定。
 │  windows_provision.bat     ← 啟動入口，以系統管理員身份執行
 │
 ├─ core\
-│   ├─ main.py               ← 主程式邏輯
+│   ├─ main.py               ← 主流程入口（選單、互動、驗證彙整）
+│   ├─ bootstrap.py          ← 啟動前檢查（依賴安裝、外掛偵測、winget.txt 解析）
+│   ├─ phases.py             ← 部署階段實作（restore/winget/system/theme/setup 等）
 │   ├─ utils.py              ← 共用工具函式模組
 │   ├─ winget.txt            ← （選擇性）核心 winget 套件清單
 │   ├─ *.reg                 ← （選擇性）Normal Mode 專用登錄檔
@@ -72,11 +74,13 @@ Windows 自動化佈署工具，以雙擊 `.bat` 的方式完成全機設定。
 
 1. 雙擊執行 `windows_provision.bat`。腳本內建 UAC 提權機制，會自動要求以**系統管理員**身份執行 。
 2. 腳本會檢查系統環境。若未安裝 Python，將自動透過 winget 靜默安裝 **Python 3.14** 。
-3. 環境確認無誤後，腳本會自動呼叫並執行 `core\main.py` 。
+3. 環境確認無誤後，腳本會自動呼叫並執行 `core\main.py --run` 。
 4. 主選單出現後選擇所需模式：
    - **1. 系統部署**：進入安裝與還原問卷流程。
    - **2. 資料備份**：備份當前使用者資料夾。
    - **3. 結束**
+
+> 補充：若直接執行 `core\main.py`（非 `.bat` 啟動），程式預設進入 `--dry-run` 模式，只列印流程與環境偵測，不執行實際部署。
 
 ---
 
@@ -140,7 +144,7 @@ Discord.Discord
 |------|------|
 | `info(msg)` | 輸出帶有時間戳記的資訊訊息。 |
 | `error(category, label, detail)` | 記錄失敗資訊並輸出至終端機，統一寫入全域 `_FAILURES` 清單供最終日誌使用。 |
-| `run_quiet(cmd, ...)` | 靜默執行子程序指令，不會拋出例外，可選擇是否擷取標準輸出。 |
+| `run_quiet(cmd, ...)` | 靜默執行子程序指令，不會拋出例外；支援 `check_return/ok_codes/label` 以便統一錯誤記錄。 |
 | `robocopy_folder(src, dst)` | 執行 `robocopy /mir` 鏡像複製，並自動重設目標資料夾的 ACL 權限。 |
 | `xcopy_folder(src, dst)` | 執行 `xcopy /s /y`，若複製失敗會自動記錄至錯誤清單。 |
 | `sync_programfiles(source_dir, target_root)` | 批次將來源目錄下的各子資料夾透過 `robocopy` 同步至目標根目錄。 |

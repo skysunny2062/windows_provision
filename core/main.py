@@ -1,42 +1,17 @@
-import importlib.util
+import argparse
 import os
 import subprocess
 import sys
+import importlib.util
+from bootstrap import ensure_modules, detect_plugins, parse_winget_txt
+
 _REQUIRED_MODULES = [
     ("pywin32", "win32gui"),
 ]
-
-def ensure_modules(mods, max_restart=2):
-    """自動安裝缺少的 pip 套件，若失敗超過 max_restart 次則中止腳本"""
-    missing = [pip for pip, imp in mods if importlib.util.find_spec(imp) is None]
-    if not missing:
-        return
-    restart_count = int(os.environ.get("AUTO_INSTALL_RESTART_COUNT", "0"))
-    if restart_count >= max_restart:
-        print(f"錯誤：已重啟 {max_restart} 次，套件仍無法載入，請手動安裝：")
-        print("  pip install " + " ".join(missing))
-        os.system("pause")
-        sys.exit(1)
-    print(f"正在安裝pip: {', '.join(missing)}")
-    try:
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install",
-            *missing,
-            "--upgrade",
-            "--quiet",
-            "--disable-pip-version-check",
-            "--no-warn-script-location",
-            "--no-cache-dir"
-        ])
-    except subprocess.CalledProcessError as e:
-        print(f"pip 安裝失敗: {e}")
-        print("請手動執行: pip install " + " ".join(missing))
-        os.system("pause")
-        sys.exit(1)
-    print("正在重新啟動腳本...")
-    new_env = os.environ.copy()
-    new_env["AUTO_INSTALL_RESTART_COUNT"] = str(restart_count + 1)
-    os.execve(sys.executable, [sys.executable, *sys.argv], new_env)
+SC_DISABLE_OK_CODES = (0, 1060)
+SCHTASKS_DELETE_OK_CODES = (0, 1)
+XCOPY_OK_CODES = (0, 1)
+WINGET_INSTALL_OK_CODES = (0, -1978335189, -1978335140, 2316632107)
 
 ensure_modules(_REQUIRED_MODULES)
 
@@ -49,14 +24,11 @@ from utils import (
     fix_acl, robocopy,
     robocopy_folder, xcopy_folder, sync_programfiles, safe_listdir,
 )
-import base64
 import ctypes
 import ctypes.wintypes
 import datetime
-import json
 import socket
 import ssl
-import stat
 import struct
 import time
 import urllib.request
@@ -64,14 +36,15 @@ import winreg
 import win32gui
 import win32con
 from concurrent.futures import ThreadPoolExecutor
-from functools import cache, lru_cache
+from functools import cache
+from phases import run_install
 
 # ── 視窗與系統常數 ────────────────────────────────────
 _HWND_TOPMOST   = ctypes.wintypes.HWND(-1)
 _HWND_NOTOPMOST = ctypes.wintypes.HWND(-2)
 _SWP_FLAGS      = 0x0001 | 0x0002  # SWP_NOSIZE | SWP_NOMOVE
 
-PROGRAM_NAME = "Zack Provision Ver260328"
+PROGRAM_NAME = "Zack Provision Ver260329"
 
 # ── 路徑定義 ──────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # core 目錄
@@ -108,59 +81,9 @@ _USER_FOLDERS = [
 _BACKUP_LABELS = {label for label, _ in _USER_FOLDERS} | {"AnyDesk"}
 
 # ── 外掛模組偵測 ──────────────────────────────────────
-def _detect_plugins():
-    """
-    掃描根目錄下的子資料夾，若符合 `目錄名/目錄名.py` 格式則自動載入為擴充外掛。
-    回傳字典：{ "Xxx Mode": (module, plugin_dir) }
-    """
-    plugins = {}
-    try:
-        for entry in os.listdir(ROOT_DIR):
-            plugin_dir = os.path.join(ROOT_DIR, entry)
-            plugin_py  = os.path.join(plugin_dir, f"{entry}.py")
-            if os.path.isdir(plugin_dir) and os.path.isfile(plugin_py):
-                mode_name = f"{entry.capitalize()} Mode"
-                try:
-                    spec   = importlib.util.spec_from_file_location(entry, plugin_py)
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-                    plugins[mode_name] = (module, plugin_dir)
-                except Exception as e:
-                    print(f"外掛載入失敗 [{entry}]: {e}")
-    except Exception:
-        pass
-    return plugins
-
-PLUGINS = _detect_plugins()
-
-# ── winget.txt 解析──────────────────────────────────
-@lru_cache(maxsize=32)
-def _parse_winget_txt(path):
-    """
-    解析 winget 清單檔，每行格式支援：pkg_id[,exact][,msstore][,name=顯示名稱]
-    忽略空行與以 '#' 開頭的註解行。
-    回傳 Tuple 列表：(pkg_id, exact:bool, source:str, display_name:str|None)
-    """
-    pkgs = []
-    if not os.path.isfile(path):
-        return pkgs
-    with open(path, encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts        = [p.strip() for p in line.split(",")]
-            pkg_id       = parts[0]
-            flags        = set(parts[1:])
-            exact        = "exact" in flags
-            source       = "msstore" if "msstore" in flags else "winget"
-            name_kv      = next((p for p in flags if p.lower().startswith("name=")), None)
-            display_name = name_kv.split("=", 1)[1] if name_kv else None
-            pkgs.append((pkg_id, exact, source, display_name))
-    return pkgs
+PLUGINS = detect_plugins(ROOT_DIR)
 
 # ── 狀態與日誌追蹤 ────────────────────────────────────
-LOG_PATH = None
 FAILURES = state.failures
 
 # ── UI 與視窗工具 ─────────────────────────────────────
@@ -202,7 +125,11 @@ def _release_topmost():
 # ── 系統核心工具函式 ──────────────────────────────────
 def import_reg(path):
     """匯入單一登錄檔 (.reg)"""
-    r = run_quiet(["reg", "import", path])
+    r = run_quiet(
+        ["reg", "import", path],
+        check_return=True,
+        label=f"reg import {os.path.basename(path)}",
+    )
     if r and r.returncode != 0:
         print(f"新增REG失敗: {os.path.basename(path)} (code {r.returncode})")
         error("Registry", os.path.basename(path), f"returncode={r.returncode}")
@@ -271,8 +198,8 @@ def reg_set(hive, key, name, reg_type, value):
         print(f"REG 失敗 [{key}] {name}: {e}")
 
 def sc_disable(service):
-    r = run_quiet(["sc", "config", service, "start=", "disabled"])
-    return r is not None and r.returncode in (0, 1060)
+    r = run_quiet(["sc", "config", service, "start=", "disabled"], check_return=True, ok_codes=SC_DISABLE_OK_CODES, label=f"disable service {service}")
+    return r is not None and r.returncode in SC_DISABLE_OK_CODES
 
 def sc_disable_retry(service):
     for _ in range(2):
@@ -282,7 +209,7 @@ def sc_disable_retry(service):
     error("Service", service, "sc config failed")
 
 def schtasks_delete(task):
-    run_quiet(["schtasks", "/delete", "/tn", task, "/f"])
+    run_quiet(["schtasks", "/delete", "/tn", task, "/f"], check_return=True, ok_codes=SCHTASKS_DELETE_OK_CODES, label=f"delete task {task}")
 
 # ── 通用等待機制 (Polling Helper) ─────────────────────
 def _wait_until(cond_fn, timeout=10, interval=0.1) -> bool:
@@ -308,7 +235,7 @@ def winget_install_pkg(pkg, exact=False, source="winget", _retry_queue=None):
         try:
             r = subprocess.run(cmd, timeout=600)
             # 處理已知的 winget 成功與警告回傳碼
-            if r.returncode in (0, -1978335189, -1978335140, 2316632107):
+            if r.returncode in WINGET_INSTALL_OK_CODES:
                 return True
         except subprocess.TimeoutExpired:
             info(f"  timeout {pkg}，加入 final retry 佇列")
@@ -398,7 +325,12 @@ def install_fonts(font_dir):
             continue
         src = os.path.join(font_dir, fname)
         try:
-            run_quiet(["xcopy", "/y", src, SYSTEM_FONTS + "\\"])
+            run_quiet(
+                ["xcopy", "/y", src, SYSTEM_FONTS + "\\"],
+                check_return=True,
+                ok_codes=XCOPY_OK_CODES,
+                label=f"install font {fname}",
+            )
             reg_name = _get_font_reg_name(src)
             reg_set(winreg.HKEY_LOCAL_MACHINE, FONTS_REG, reg_name, winreg.REG_SZ, fname)
             installed += 1
@@ -448,7 +380,11 @@ def wait_window_and_close(title, timeout=10):
     def _find():
         return any(win32gui.FindWindow(None, t) for t in candidates)
     if _wait_until(_find, timeout=timeout):
-        run_quiet(["taskkill", "/im", "systemsettings.exe", "/f"])
+        run_quiet(
+            ["taskkill", "/im", "systemsettings.exe", "/f"],
+            check_return=True,
+            label="taskkill systemsettings",
+        )
 
 # ── 系統設定最佳化 ────────────────────────────────────
 def apply_system_settings():
@@ -463,7 +399,7 @@ def apply_system_settings():
         ["winget", "uninstall", "--id", "Microsoft.OneDrive", "--silent", "--accept-source-agreements"],
     ]
     for cmd in system_cmds:
-        run_quiet(cmd)
+        run_quiet(cmd, check_return=True, label=" ".join(cmd))
 
     for svc in ["CscService", "DusmSvc", "Spooler"]:
         sc_disable_retry(svc)
@@ -478,33 +414,48 @@ def apply_system_settings():
     ]:
         schtasks_delete(task)
 
-def _write_failure_log(install_mode, plugin_dir, bg_names=None):
+def _write_failure_log(log_path, install_mode, plugin_dir, bg_names=None):
     """
     執行安裝最終的健康度與狀態驗證，並匯出執行 Log。
     平行檢查 winget 套件安裝狀態，比對服務狀態與必要檔案。
     """
-    if not LOG_PATH:
-        return
-
-    check_pkgs = _parse_winget_txt(CORE_WINGET)
+    check_pkgs = parse_winget_txt(CORE_WINGET)
     if plugin_dir:
-        check_pkgs += _parse_winget_txt(os.path.join(plugin_dir, "winget.txt"))
+        check_pkgs += parse_winget_txt(os.path.join(plugin_dir, "winget.txt"))
 
-    def _verify_pkg(pkg_id):
+    def _verify_pkg(pkg_entry):
+        pkg_id, _exact, source, display_name = pkg_entry
+        name_tail = pkg_id.rsplit(".", 1)[-1] if "." in pkg_id else pkg_id
+        queries = [
+            ["winget", "list", "--id", pkg_id, "--exact"],
+            ["winget", "list", "--id", pkg_id],
+        ]
+        if source == "msstore":
+            queries.extend([
+                ["winget", "list", "--id", pkg_id, "--exact", "--source", "msstore"],
+                ["winget", "list", "--id", pkg_id, "--source", "msstore"],
+            ])
+        if display_name:
+            queries.extend([
+                ["winget", "list", "--name", display_name, "--exact"],
+                ["winget", "list", "--name", display_name],
+            ])
+        if name_tail and name_tail != pkg_id:
+            queries.extend([
+                ["winget", "list", "--name", name_tail, "--exact"],
+                ["winget", "list", "--name", name_tail],
+            ])
         try:
-            r = subprocess.run(
-                ["winget", "list", "--id", pkg_id, "--exact"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            if r.returncode != 0:
-                return ("--:--:--", "Verify-Package", pkg_id, "winget list --id 未偵測到")
+            for cmd in queries:
+                r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if r.returncode == 0:
+                    return None
+            return ("--:--:--", "Verify-Package", pkg_id, "winget list 未偵測到（id/name/source fallback 皆失敗）")
         except Exception as e:
             return ("--:--:--", "Verify-Package", pkg_id, str(e))
-        return None
 
-    pkg_ids = [p for p, *_ in check_pkgs]
     with ThreadPoolExecutor(max_workers=8) as ex:
-        verify_results = list(ex.map(_verify_pkg, pkg_ids))
+        verify_results = list(ex.map(_verify_pkg, check_pkgs))
 
     verifyFAILURES = [r for r in verify_results if r is not None]
 
@@ -524,7 +475,7 @@ def _write_failure_log(install_mode, plugin_dir, bg_names=None):
         except Exception as e:
             verifyFAILURES.append(("--:--:--", "Verify-Service", svc, str(e)))
 
-    runtime_labels = {f[2] for f in FAILURES}
+    runtime_labels = {f.label for f in FAILURES}
     finalFAILURES = [
         (ts, cat, label, detail)
         for ts, cat, label, detail in verifyFAILURES
@@ -552,14 +503,14 @@ def _write_failure_log(install_mode, plugin_dir, bg_names=None):
     if FAILURES:
         lines.append("")
         lines.append("[Runtime Warnings - retry 後可能已成功，僅供參考]")
-        for ts, cat, label, detail in FAILURES:
-            lines.append(fmt_line(ts, cat, label, detail))
+        for item in FAILURES:
+            lines.append(fmt_line(item.ts, item.category, item.label, item.detail))
 
     try:
-        with open(LOG_PATH, "w", encoding="utf-8") as f:
+        with open(log_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         fail_str = f" ({len(finalFAILURES)} 個失敗)" if finalFAILURES else ""
-        print(f"Log：{LOG_PATH}\n\n系統部署完成{fail_str}")
+        print(f"Log：{log_path}\n\n系統部署完成{fail_str}")
         if bg_names:
             names_str = " / ".join(bg_names)
             print(f"{names_str} 於背景執行中，請接手\n")
@@ -631,7 +582,7 @@ def _resolve_restore_dir() -> str | None:
         if candidate and os.path.isdir(candidate):
             sub_items = [l for l in _BACKUP_LABELS if os.path.isdir(os.path.join(candidate, l))]
             sub_label = "/".join(sub_items) if sub_items else ""
-            print(f"\n備份來源：{candidate}  [{sub_label}]")
+            print(f"\n還原來源：{candidate}  [{sub_label}]")
             if input("備份檔案所在資料夾正確嗎? (輸入Y/N繼續): ").upper() == "Y":
                 return candidate
             candidate = None
@@ -674,288 +625,58 @@ def install():
         os.system("cls")
         _show_confirm(restore_label)
 
-    _run_install(pc_input, pc_name, install_mode, crack, restore_dir, plugin_mod, plugin_dir)
+    _run_install(pc_input, install_mode, crack, restore_dir, plugin_mod, plugin_dir)
 
-# ── 部署階段 (Install Phases) ─────────────────────────
-def _phase_restore(restore_dir):
-    if not restore_dir:
-        return
-    anydesk_dst = os.path.join(PROGRAM_DATA, "AnyDesk")
-    for label, eng in _USER_FOLDERS:
-        src = os.path.join(restore_dir, label)
-        dst = os.path.join(USER_DIR, eng)
-        if os.path.isdir(src):
-            cmd = (f'start "還原{label}" cmd /k '
-                   f'"COLOR 0B & robocopy "{src}" "{dst}" /s /mt:8 /r:10 /w:3 /xf desktop.ini"')
-            subprocess.Popen(cmd, shell=True)
-    anydesk_src = os.path.join(restore_dir, "AnyDesk")
-    if os.path.isdir(anydesk_src):
-        cmd = (f'start "還原AnyDesk" cmd /k '
-               f'"COLOR 0B & robocopy "{anydesk_src}" "{anydesk_dst}" /mir /mt:8 /r:10 /w:3"')
-        subprocess.Popen(cmd, shell=True)
-    print("開始還原資料...")
-
-def _phase_office():
-    office_dir = os.path.join(PROGRAMFILES, "Microsoft Office")
-    if os.path.isdir(office_dir):
-        return None, None
-    img_files = [f for f in safe_listdir(SCRIPT_DIR) if f.lower().endswith(".img")]
-    if not img_files:
-        print("Core資料夾內無Office的img 此次將略過Office")
-        return None, None
-    img_path = os.path.join(SCRIPT_DIR, img_files[0])
-    r = subprocess.run(
-        ["powershell", "-Command",
-         f"(Mount-DiskImage -ImagePath '{img_path}' -PassThru | Get-Volume).DriveLetter"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    drive = r.stdout.strip()
-    if not drive:
-        print("Office 掛載失敗")
-        return None, None
-    setup_exe = f"{drive}:\\Setup.exe"
-    if not _wait_until(lambda: os.path.exists(setup_exe), timeout=5):
-        print("Office 找不到 Setup.exe")
-        return None, None
-    print("安裝 Office...")
-    office_proc = subprocess.Popen([setup_exe], cwd=os.path.dirname(setup_exe))
-    return img_path, office_proc
-
-def _phase_office_cleanup(img_path, office_proc):
-    if office_proc is not None:
-        run_quiet(["taskkill", "/f", "/im", "OfficeC2RClient.exe"])
-    if img_path:
-        run_quiet(["powershell", "-Command",
-                    f"Dismount-DiskImage -ImagePath '{img_path}'"])
-
-def _phase_git(retry_queue):
+def _reset_git_cache():
     global _GIT_EXE_CACHE
-    print("安裝 Git...")
-    winget_install_pkg("Git.Git", exact=False, source="winget", _retry_queue=retry_queue)
-    os.system("COLOR 0B")
-    for _ in range(5):
-        _GIT_EXE_CACHE = None
-        if _get_git_exe() != "git":
-            break
-        time.sleep(1)
-    _inject_git_path()
+    _GIT_EXE_CACHE = None
 
-def _phase_files(plugin_mod):
-    """
-    部署自訂檔案：
-    1. 安裝核心字型。
-    2. 複製核心佈景主題與 Windows 自定義檔案。
-    3. 若有載入擴充外掛，則觸發外掛專屬的 custom_files() 流程。
-    """
-    themes_dst = os.path.join(WINDIR, "Resources", "Themes")
-    install_fonts(CORE_FONTS)
-    if os.path.isdir(CORE_THEMES):
-        xcopy_folder(CORE_THEMES, themes_dst)
-    if os.path.isdir(CORE_WINDIR):
-        xcopy_folder(CORE_WINDIR, WINDIR)
-    if plugin_mod and hasattr(plugin_mod, "custom_files"):
-        plugin_mod.custom_files()
-    return themes_dst
 
-def _phase_mpv():
-    mpv_dst = os.path.join(PROGRAMFILES, "mpv_PlayKit")
-    print("安裝 mpv_PlayKit...")
-    try:
-        git_exe = _get_git_exe()
-        if os.path.isdir(mpv_dst):
-            r_git = subprocess.run([git_exe, "pull"], cwd=mpv_dst)
-        else:
-            r_git = subprocess.run(
-                [git_exe, "clone", "--depth=1", "https://github.com/skysunny2062/mpv_PlayKit.git"],
-                cwd=PROGRAMFILES
-            )
-        if r_git.returncode != 0:
-            raise RuntimeError(f"git 失敗 returncode={r_git.returncode}")
-        fix_acl(mpv_dst)
-        mpv_com = os.path.join(mpv_dst, "mpv.com")
-        subprocess.run([mpv_com, "--config=no", "--register"])
-        mpv_exe  = os.path.join(mpv_dst, "mpv.exe")
-        lnk_path = os.path.join(DESKTOP, "mpv_PlayKit.lnk")
-        ps = (
-            f'$s=(New-Object -COM WScript.Shell).CreateShortcut("{lnk_path}");'
-            f'$s.TargetPath="{mpv_exe}";'
-            f'$s.WorkingDirectory="{mpv_dst}";'
-            f'$s.Save()'
-        )
-        run_quiet(["powershell", "-Command", ps])
-        os.system("COLOR 0B")
-    except Exception as e:
-        print(f"mpv_PlayKit 失敗: {e}")
-        error("Installer", "mpv_PlayKit", str(e))
-
-def _install_winget_list(path, retry_queue):
-    for pkg_id, exact, source, display_name in _parse_winget_txt(path):
-        _name = display_name or (pkg_id.split(".", 1)[1] if "." in pkg_id else pkg_id)
-        print(f"\n安裝 {_name}...")
-        winget_install_pkg(pkg_id, exact=exact, source=source, _retry_queue=retry_queue)
-        os.system("COLOR 0B")
-
-def _phase_winget(plugin_dir, retry_queue):
-    """
-    透過 winget 安裝軟體：
-    1. 讀取並安裝核心 core/winget.txt 清單。
-    2. 若有載入外掛，則接續安裝外掛專屬的 winget.txt。
-    """
-    _install_winget_list(CORE_WINGET, retry_queue)
-    if plugin_dir:
-        _install_winget_list(os.path.join(plugin_dir, "winget.txt"), retry_queue)
-
-def _phase_system(install_mode, plugin_dir, pc_input):
-    """
-    匯入系統登錄檔與基礎設定：
-    1. 疊加核心的 core/reg/*.reg。
-    2. 根據是否掛載外掛，匯入根目錄或外掛目錄下的 .reg 檔。
-    3. 套用系統優化及重命名電腦名稱。
-    """
-    import_reg_dir(CORE_REG_DIR)
-    if plugin_dir:
-        import_reg_dir(plugin_dir)
-    else:
-        import_reg_dir(SCRIPT_DIR)
-    apply_system_settings()
-
-    if pc_input:
-        HKLM = winreg.HKEY_LOCAL_MACHINE
-        SZ   = winreg.REG_SZ
-        for key, val in [
-            (r"SYSTEM\CurrentControlSet\Services\lanmanserver\Parameters",        "srvcomment"),
-            (r"SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName", "ComputerName"),
-            (r"SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName",       "ComputerName"),
-            (r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",               "NV Hostname"),
-            (r"System\CurrentControlSet\Services\Tcpip\Parameters",               "Hostname"),
-        ]:
-            reg_set(HKLM, key, val, SZ, pc_input)
-    YYMMDD = datetime.datetime.now().strftime("%y%m%d")
-    reg_set(winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation",
-            "Model", winreg.REG_SZ, f"{PROGRAM_NAME} build:{YYMMDD}")
-
-def _phase_vcredist():
-    print("\n安裝 VisualCppRedistAIO...")
-    try:
-        _ssl_ctx = ssl.create_default_context()
-        _ssl_ctx.check_hostname = False
-        _ssl_ctx.verify_mode    = ssl.CERT_NONE
-        req = urllib.request.Request(
-            "https://api.github.com/repos/abbodi1406/vcredist/releases/latest",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        with urllib.request.urlopen(req, context=_ssl_ctx) as r:
-            data = json.loads(r.read())
-        for asset in data["assets"]:
-            if asset["name"].lower() == "visualcppredist_aio_x86_x64.exe":
-                dest = os.path.join(TEMP, asset["name"])
-                if download_file(asset["browser_download_url"], dest):
-                    try:
-                        subprocess.run([dest, "/y"], timeout=300)
-                    except subprocess.TimeoutExpired:
-                        error("Installer", "VisualCppRedistAIO", "安裝程式 timeout (300s)")
-                    os.remove(dest)
-                else:
-                    error("Installer", "VisualCppRedistAIO", "下載重試耗盡")
-                break
-    except Exception as e:
-        print(f"VisualCppRedistAIO 下載失敗: {e}")
-        error("Installer", "VisualCppRedistAIO", str(e))
-
-def _phase_crack(crack):
-    if not crack:
-        return
-    print("CrackActivation...")
-    winrar_key = os.path.join(PROGRAMFILES, "WinRAR", "rarreg.key")
-    os.makedirs(os.path.dirname(winrar_key), exist_ok=True)
-    with open(winrar_key, "w") as f:
-        f.write(
-            "RAR registration data\n"
-            "SeVeN\n"
-            "Unlimited Company License\n"
-            "UID=000de082d4cb7aeb3e71\n"
-            "64122122503e71057c0ffe5fed5dcbb0032f2d3c5fd42bb05edfe0\n"
-            "6501b129e6e067e3819160fce6cb5ffde62890079861be57638717\n"
-            "7131ced835ed65cc743d9777f2ea71a8e32c7e593cf66794343565\n"
-            "b41bcf56929486b8bcdac33d50ecf77399603fc518f2701b607304\n"
-            "9b712761e333304a99485f38f292bc89b78036ec4c0faa35b6c3d6\n"
-            "df05d84217aef4abd0b675d3309b94f4be9c9cae1734784060e0c7\n"
-            "ef6e1deace43f1671ef3ef6d863944c13f3fc13a20f21488793187\n"
-        )
-    ps_script = "& ([ScriptBlock]::Create((irm https://get.activated.win))) /HWID /Ohook"
-    encoded   = base64.b64encode(ps_script.encode("utf-16-le")).decode()
-    try:
-        subprocess.run(["powershell", "-ExecutionPolicy", "Bypass",
-                        "-EncodedCommand", encoded], timeout=120)
-    except subprocess.TimeoutExpired:
-        error("Activation", "Windows Activation", "PowerShell timeout (120s)")
-    except Exception as e:
-        error("Activation", "Windows Activation", str(e))
-
-def _phase_theme(themes_dst):
-    theme_files = [f for f in safe_listdir(CORE_THEMES) if f.lower().endswith(".theme")]
-    if theme_files:
-        theme_path = os.path.join(themes_dst, theme_files[0])
-        os.startfile(theme_path)
-        wait_window_and_close("設定")
-    subprocess.run(["taskkill", "/f", "/im", "explorer.exe"])
-    iconcache = os.path.join(LOCAL_APPDATA, "iconcache.db")
-    if os.path.exists(iconcache):
-        try:
-            run_quiet(["attrib", "-s", "-r", "-h", iconcache])
-            os.chmod(iconcache, stat.S_IWRITE)
-            os.remove(iconcache)
-        except Exception as e:
-            print(f"iconcache 刪除失敗: {e}")
-    time.sleep(2)
-    subprocess.Popen(["explorer.exe"])
-
-def _phase_setup(plugin_mod):
-    """
-    觸發各類安裝執行檔 (Setup):
-    1. 將 core/setup 內的所有 .exe 置入背景靜默執行。
-    2. 若有載入外掛，則觸發外掛自定義的 custom_setup() 流程。
-    """
-    _bg_names = []
-    for f in safe_listdir(CORE_SETUP):
-        fp = os.path.join(CORE_SETUP, f)
-        if os.path.isfile(fp) and fp.lower().endswith(".exe"):
-            subprocess.Popen(f'cmd /c start "" /min "{fp}"', shell=True)
-            _bg_names.append(os.path.splitext(f)[0])
-    if plugin_mod and hasattr(plugin_mod, "custom_setup"):
-        plugin_bg = plugin_mod.custom_setup()
-        if plugin_bg:
-            _bg_names.extend(plugin_bg)
-    return _bg_names
-
-def _run_install(pc_input, pc_name, install_mode, crack, restore_dir, plugin_mod, plugin_dir):
-    global LOG_PATH
-    FAILURES.clear()
-    retry_queue = []
-    ts = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
-    LOG_PATH = os.path.join(DESKTOP, f"{PROGRAM_NAME}_Log_{ts}.txt")
-    _maximize_console()
-
-    _phase_restore(restore_dir)
-    img_path, office_proc = _phase_office()
-    _phase_git(retry_queue)
-    themes_dst = _phase_files(plugin_mod)
-    _phase_mpv()
-    _phase_office_cleanup(img_path, office_proc)
-    _phase_winget(plugin_dir, retry_queue)
-    _phase_system(install_mode, plugin_dir, pc_input)
-    set_best_appearance()
-    _release_topmost()
-    _phase_vcredist()
-    _phase_crack(crack)
-    _phase_theme(themes_dst)
-    _bg_names = _phase_setup(plugin_mod)
-
-    _final_retry_installers(retry_queue)
-    _write_failure_log(install_mode, plugin_dir, _bg_names)
-    sc_disable_retry("CryptSvc")
-    os.system("pause")
+def _run_install(pc_input, install_mode, crack, restore_dir, plugin_mod, plugin_dir):
+    ctx = {
+        "PROGRAM_NAME": PROGRAM_NAME,
+        "SCRIPT_DIR": SCRIPT_DIR,
+        "CORE_REG_DIR": CORE_REG_DIR,
+        "CORE_SETUP": CORE_SETUP,
+        "CORE_THEMES": CORE_THEMES,
+        "CORE_WINDIR": CORE_WINDIR,
+        "CORE_WINGET": CORE_WINGET,
+        "CORE_FONTS": CORE_FONTS,
+        "WINDIR": WINDIR,
+        "PROGRAMFILES": PROGRAMFILES,
+        "USER_DIR": USER_DIR,
+        "DESKTOP": DESKTOP,
+        "LOCAL_APPDATA": LOCAL_APPDATA,
+        "TEMP": TEMP,
+        "PROGRAM_DATA": PROGRAM_DATA,
+        "USER_FOLDERS": _USER_FOLDERS,
+        "FAILURES": FAILURES,
+        "safe_listdir": safe_listdir,
+        "wait_until": _wait_until,
+        "run_quiet": run_quiet,
+        "winget_install_pkg": winget_install_pkg,
+        "reset_git_cache": _reset_git_cache,
+        "get_git_exe": _get_git_exe,
+        "inject_git_path": _inject_git_path,
+        "install_fonts": install_fonts,
+        "xcopy_folder": xcopy_folder,
+        "fix_acl": fix_acl,
+        "parse_winget_txt": parse_winget_txt,
+        "import_reg_dir": import_reg_dir,
+        "apply_system_settings": apply_system_settings,
+        "reg_set": reg_set,
+        "download_file": download_file,
+        "wait_window_and_close": wait_window_and_close,
+        "set_best_appearance": set_best_appearance,
+        "sc_disable_retry": sc_disable_retry,
+        "final_retry_installers": _final_retry_installers,
+        "write_failure_log": _write_failure_log,
+        "maximize_console": _maximize_console,
+        "release_topmost": _release_topmost,
+        "info": info,
+        "error": error,
+    }
+    run_install(pc_input, install_mode, crack, restore_dir, plugin_mod, plugin_dir, ctx)
 
 # ── 資料備份作業 ──────────────────────────────────────
 def data_backup():
@@ -1014,6 +735,58 @@ def data_backup():
         os.system("pause")
         return
 
+def _print_dry_run_preview(auto_reason=False):
+    _print_header()
+    print("[DRY-RUN] 僅列印流程，不執行任何安裝、複製、寫入或登錄變更。\n")
+    if auto_reason:
+        print("偵測到非 bat 啟動，已自動進入 dry-run。")
+    print("環境偵測：")
+    print(f"- Python: {sys.executable}")
+    print(f"- pywin32: {'OK' if importlib.util.find_spec('win32gui') else 'MISSING'}")
+    print(f"- Core winget: {'FOUND' if os.path.isfile(CORE_WINGET) else 'MISSING'}")
+    print(f"- Core reg count: {len([f for f in safe_listdir(CORE_REG_DIR) if f.lower().endswith('.reg')])}")
+    print(f"- Core theme count: {len([f for f in safe_listdir(CORE_THEMES) if f.lower().endswith('.theme')])}")
+    print(f"- Plugins: {', '.join(PLUGINS) if PLUGINS else 'None'}")
+    print("\n可用模式：")
+    print("1. Normal Mode")
+    for idx, mode_name in enumerate(PLUGINS, start=2):
+        print(f"{idx}. {mode_name}")
+    print("\n預計流程：")
+    phases = [
+        "Restore (若選擇還原)",
+        "Office (若有 .img)",
+        "Git",
+        "Files",
+        "mpv_PlayKit",
+        "Winget",
+        "System",
+        "VisualCppRedistAIO",
+        "Theme",
+        "Setup",
+        "Final Retry + Verify Log",
+    ]
+    for idx, phase in enumerate(phases, start=1):
+        print(f"{idx:02d}. {phase}")
+    print("\n(按任意鍵後結束)")
+    print()
+    os.system("pause")
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--dry-run", action="store_true", help="僅列印流程，不執行部署")
+    parser.add_argument("--run", action="store_true", help="強制進入正式部署選單")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     ctypes.windll.kernel32.SetConsoleTitleW(PROGRAM_NAME)
-    menu()
+    args = _parse_args()
+    launched_from_bat = os.environ.get("WP_LAUNCH_MODE") == "full"
+    auto_dry_run = (not launched_from_bat) and (not args.run) and (not args.dry_run)
+    if args.dry_run or auto_dry_run:
+        os.system("COLOR 04")
+        _print_dry_run_preview(auto_reason=auto_dry_run)
+    else:
+        os.system("COLOR 0B")
+        menu()

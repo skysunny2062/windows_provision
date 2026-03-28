@@ -87,6 +87,38 @@ def reg_key_deleted(hive, key):
 HKLM = winreg.HKEY_LOCAL_MACHINE
 HKCU = winreg.HKEY_CURRENT_USER
 
+UPSTREAM_SETUPCOMPLETE_DISABLED = [
+    "DPS", "iphlpsvc", "ShellHWDetection", "stisvc", "SysMain",
+    "TrkWks", "WdiServiceHost", "WdiSystemHost", "WerSvc",
+]
+UPSTREAM_EXTRA_DISABLED = [
+    "XboxGipSvc", "RemoteRegistry", "WaaSMedicSvc", "DiagTrack",
+    "WSearch", "CscService", "DusmSvc", "WpcMonSvc",
+    "wisvc", "Wecsvc", "WebClient", "UevAgentService", "udfs",
+    "tzautoupdate", "SNMPTrap", "SmsRouter", "SharedAccess",
+    "SCPolicySvc", "PimIndexMaintenanceSvc", "PeerDistSvc",
+    "NetTcpPortSharing", "MsKeyboardFilter", "MSDTC", "InventorySvc",
+    "hvcrash", "GraphicsPerfSvc", "fhsvc", "Fax",
+    "DialogBlockingService", "diagnosticshub.standardcollector.service",
+    "cnghwassist", "cdfs", "AxInstSV", "AppVClient", "AppMgmt", "ALG",
+    "dmwappushservice", "dcpsvc", "RetailDemo",
+]
+UPSTREAM_EXTRA_SETUPCOMPLETE_DISABLED = [
+    "SgrmBroker", "SgrmAgent", "PolicyAgent", "WPDBusEnum",
+    "PcaSvc", "wscsvc", "SENS", "shpamsvc", "RemoteAccess",
+    "UevAgentDriver", "ssh-agent",
+]
+UPSTREAM_REMOVED_SERVICES = [
+    "webthreatdefsvc", "webthreatdefusersvc",
+    "SecurityHealthService", "MsSecFlt", "MsSecWfp",
+]
+UPSTREAM_PLUTON_SERVICES = ["PlutonHsp2", "PlutonHeci", "Hsp"]
+UPSTREAM_REQUIRED_AUTO_SERVICES = [
+    "EventSystem", "wuauserv", "BFE", "MpsSvc",
+    "RpcSs", "SamSs", "nsi", "LanmanWorkstation", "lmhosts",
+    "hidserv",
+]
+
 def show(label, hive, key, name, expect):
     """比對登錄檔實際值與預期值，並輸出 ✓ 或 ✗ 結果。"""
     val = reg_get(hive, key, name)
@@ -183,44 +215,31 @@ _switch_to_upstream()
 # ──────────────────────────────────────────────────────────
 section("【上游】服務停用（SetupComplete.cmd）")
 # ──────────────────────────────────────────────────────────
-for svc in ["DPS","iphlpsvc","ShellHWDetection","stisvc","SysMain",
-            "TrkWks","WdiServiceHost","WdiSystemHost","WerSvc"]:
+for svc in UPSTREAM_SETUPCOMPLETE_DISABLED:
     show_svc(svc, "disabled")
 
 # ──────────────────────────────────────────────────────────
 section("【上游】服務額外停用（我從未做過）")
 # ──────────────────────────────────────────────────────────
-for svc in ["XboxGipSvc","RemoteRegistry","WaaSMedicSvc","DiagTrack",
-            "WSearch","CscService","DusmSvc","WpcMonSvc",
-            "wisvc","Wecsvc","WebClient","UevAgentService","udfs",
-            "tzautoupdate","SNMPTrap","SmsRouter","SharedAccess",
-            "SCPolicySvc","PimIndexMaintenanceSvc","PeerDistSvc",
-            "NetTcpPortSharing","MsKeyboardFilter","MSDTC","InventorySvc",
-            "hvcrash","GraphicsPerfSvc","fhsvc","Fax",
-            "DialogBlockingService","diagnosticshub.standardcollector.service",
-            "cnghwassist","cdfs","AxInstSV","AppVClient","AppMgmt","ALG",
-            "dmwappushservice","dcpsvc","RetailDemo"]:
+for svc in UPSTREAM_EXTRA_DISABLED:
     show_svc(svc, "disabled")
 w("  ※ ws2ifsl / WinHttpAutoProxySvc：Windows 系統保護，上游無法停用，不列入監控")
 
 # ──────────────────────────────────────────────────────────
 section("【上游】服務額外停用（SetupComplete.cmd，之前未涵蓋）")
 # ──────────────────────────────────────────────────────────
-for svc in ["SgrmBroker","SgrmAgent","PolicyAgent","WPDBusEnum",
-            "PcaSvc","wscsvc","SENS","shpamsvc","RemoteAccess",
-            "UevAgentDriver","ssh-agent"]:
+for svc in UPSTREAM_EXTRA_SETUPCOMPLETE_DISABLED:
     show_svc(svc, "disabled")
 w("  ※ WinHttpAutoProxySvc：Windows 系統保護維持 DEMAND，上游無法停用，不列入監控")
 
 # ──────────────────────────────────────────────────────────
 section("【上游】服務移除（NOT_INSTALLED = ✓）")
 # ──────────────────────────────────────────────────────────
-for svc in ["webthreatdefsvc","webthreatdefusersvc",
-            "SecurityHealthService","MsSecFlt","MsSecWfp"]:
+for svc in UPSTREAM_REMOVED_SERVICES:
     show_svc(svc, "removed")
 w("  ※ WdNisSvc：驅動實體已刪但服務鍵殘留（DEMAND），Windows 保護無法移除，屬已知現象，不列入監控")
 w("  ※ PlutonHsp2/PlutonHeci/Hsp：ROG 9800X3D 等有 Pluton 晶片的硬體服務會存在（DEMAND），屬硬體差異非問題")
-for svc in ["PlutonHsp2","PlutonHeci","Hsp"]:
+for svc in UPSTREAM_PLUTON_SERVICES:
     show_svc(svc, "removed")
 
 # ──────────────────────────────────────────────────────────
@@ -457,9 +476,7 @@ show("SettingsPageVisibility hide:windowsdefender", HKLM,
 # ──────────────────────────────────────────────────────────
 section("【上游】必要服務保留 AUTO")
 # ──────────────────────────────────────────────────────────
-for svc in ["EventSystem","wuauserv","BFE","MpsSvc",
-            "RpcSs","SamSs","nsi","LanmanWorkstation","lmhosts",
-            "hidserv"]:
+for svc in UPSTREAM_REQUIRED_AUTO_SERVICES:
     show_svc(svc, "auto")
 w("  ※ BITS：部分環境為 DEMAND，auto 或 demand 均屬正常")
 _bits_val = svc_start("BITS")

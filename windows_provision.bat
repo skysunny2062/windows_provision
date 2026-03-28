@@ -9,7 +9,8 @@ for /f "delims=" %%P in ('where python 2^>nul') do (
     )
 )
 if not defined PYTHON call :PythonCheck
-"!PYTHON!" %~dp0core\main.py
+set "WP_LAUNCH_MODE=full"
+"!PYTHON!" %~dp0core\main.py --run
 exit /b
 
 ::====================================================================================
