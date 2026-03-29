@@ -220,6 +220,7 @@ def _wait_until(cond_fn, timeout=10, interval=0.1) -> bool:
         time.sleep(interval)
     return False
 
+
 # ── 重試與安裝機制 ────────────────────────────────────
 def winget_install_pkg(pkg, exact=False, source="winget", _retry_queue=None):
     cmd = ["winget", "install", "--id", pkg,
@@ -230,6 +231,7 @@ def winget_install_pkg(pkg, exact=False, source="winget", _retry_queue=None):
         cmd.append("-e")
     for attempt in range(3):
         if attempt > 0:
+            os.system("COLOR 0B")
             info(f"  winget retry {attempt}/2: {pkg}")
             time.sleep(5)
         try:
@@ -237,10 +239,29 @@ def winget_install_pkg(pkg, exact=False, source="winget", _retry_queue=None):
             # 處理已知的 winget 成功與警告回傳碼
             if r.returncode in WINGET_INSTALL_OK_CODES:
                 return True
+            if source == "msstore":
+                bypass = subprocess.run(
+                    ["winget", "settings", "--enable", "BypassCertificatePinningForMicrosoftStore"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if bypass.returncode == 0:
+                    try:
+                        retry_result = subprocess.run(cmd, timeout=600)
+                        if retry_result.returncode in WINGET_INSTALL_OK_CODES:
+                            return True
+                    finally:
+                        subprocess.run(
+                            ["winget", "settings", "--disable", "BypassCertificatePinningForMicrosoftStore"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
         except subprocess.TimeoutExpired:
             info(f"  timeout {pkg}，加入 final retry 佇列")
         except Exception as e:
             info(f"  例外 {pkg}: {e}")
+        finally:
+            os.system("COLOR 0B")
     info(f"  → {pkg} 加入 final retry 佇列")
     if _retry_queue is not None:
         _retry_queue.append((pkg, cmd))

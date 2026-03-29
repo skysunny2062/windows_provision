@@ -25,9 +25,11 @@ from utils import xcopy_folder, robocopy_folder, sync_programfiles, safe_listdir
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _PROGRAMFILES = os.environ["ProgramFiles"]
 _APPDATA = os.environ["APPDATA"]
+_LOCAL_APPDATA = os.environ["LOCALAPPDATA"]
 _DESKTOP = os.path.join(os.environ["USERPROFILE"], "Desktop")
 
 ZACK_APPDATA = os.path.join(_DIR, "appdata")
+ZACK_LOCAL_APPDATA = os.path.join(_DIR, "localappdata")
 ZACK_C = os.path.join(_DIR, "c")
 ZACK_PROGRAMFILES = os.path.join(_DIR, "programfiles")
 ZACK_DESKTOP = os.path.join(_DIR, "desktop")
@@ -62,6 +64,7 @@ def custom_files():
     """
     folder_sync_jobs = [
         (ZACK_APPDATA, _APPDATA, xcopy_folder),
+        (ZACK_LOCAL_APPDATA, _LOCAL_APPDATA, xcopy_folder),
         (ZACK_DESKTOP, _DESKTOP, xcopy_folder),
     ]
     for src, dst, sync_fn in folder_sync_jobs:

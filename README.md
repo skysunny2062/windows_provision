@@ -16,24 +16,35 @@ Windows 自動化佈署工具，以雙擊 `.bat` 的方式完成全機設定。
 - Python 3.x（未安裝時腳本自動透過 winget 安裝 Python 3.14）
 
 ## 功能概覽
+- **資料還原**：自動偵測 `D:\backup_<電腦名稱>` 資料夾，或允許手動輸入路徑；在安裝流程初期即以多個背景視窗平行 `robocopy` 還原各使用者資料夾與 AnyDesk 設定。
+
+- **Microsoft Office**：偵測 `core/` 下的 `.img` 檔，以 PowerShell `Mount-DiskImage` 掛載後執行 `Setup.exe`；若 `%ProgramFiles%\Microsoft Office` 已存在則跳過。安裝完成後自動卸載映像。
+
+- **Git 安裝與注入**：透過 winget 安裝 Git，安裝後自動從登錄檔讀取路徑並注入 `PATH`，供後續流程使用。
+
+- **字型安裝**：掃描 `core/font/` 並安裝至 `C:\Windows\Fonts`，同步寫入登錄檔；目的端已存在的字型自動略過。
+
+- **mpv_PlayKit**：從 GitHub（`skysunny2062/mpv_PlayKit`）以 `git clone --depth=1` 下載，若已存在則 `git pull` 更新，部署至 `%ProgramFiles%\mpv_PlayKit`，並在桌面建立捷徑。
+
+- **檔案同步**：透過 `robocopy` / `xcopy` 部署字型、主題、`core/windir/` 至 `C:\Windows`，以及外掛指定的其他目錄。
+
+- **主題套用**：複製 `core/themes/` 下的第一個 `.theme` 到系統主題目錄並套用，套用後刪除 `iconcache.db` 並重啟 `explorer.exe`。
 
 - **winget 套件安裝**：自動安裝 `winget.txt` 中列出的應用程式，支援精確匹配與 Microsoft Store 來源。失敗時自動重試最多 3 次，仍失敗者進入 final retry 佇列，於全部流程結束後再嘗試一次。
-- **字型安裝**：掃描 `core/font/` 並安裝至 `C:\Windows\Fonts`，同步寫入登錄檔；目的端已存在的字型自動略過。
+
 - **登錄檔匯入**：套用 `core/reg/*.reg`，以及（若啟用外掛模式時）外掛目錄下的 `*.reg`。
+
 - **系統設定**：工作列、效能外觀、電源計畫（螢幕 15 分鐘、磁碟永不休眠）、BCD 開機倒數歸零、防火牆關閉、排程工作停用等，一鍵套用。
-- **主題套用**：複製 `core/themes/` 下的第一個 `.theme` 到系統主題目錄並套用，套用後刪除 `iconcache.db` 並重啟 `explorer.exe`。
-- **檔案同步**：透過 `robocopy` / `xcopy` 部署字型、主題、`core/windir/` 至 `C:\Windows`，以及外掛指定的其他目錄。
-- **Git 安裝與注入**：透過 winget 安裝 Git，安裝後自動從登錄檔讀取路徑並注入 `PATH`，供後續流程使用。
-- **mpv_PlayKit**：從 GitHub（`skysunny2062/mpv_PlayKit`）以 `git clone --depth=1` 下載，若已存在則 `git pull` 更新，部署至 `%ProgramFiles%\mpv_PlayKit`，並在桌面建立捷徑。
-- **Microsoft Office**：偵測 `core/` 下的 `.img` 檔，以 PowerShell `Mount-DiskImage` 掛載後執行 `Setup.exe`；若 `%ProgramFiles%\Microsoft Office` 已存在則跳過。安裝完成後自動卸載映像。
+
 - **VisualCppRedistAIO**：從 GitHub Releases API 取得最新版下載連結，下載後靜默安裝。
-- **資料還原**：自動偵測 `D:\backup_<電腦名稱>` 資料夾，或允許手動輸入路徑；在安裝流程初期即以多個背景視窗平行 `robocopy` 還原各使用者資料夾與 AnyDesk 設定。
-- **資料備份**：獨立於安裝流程的互動式選單，可備份桌面、下載、文件、圖片、音樂、影片、AnyDesk 設定至指定目錄（預設為 `D:\backup_<電腦名稱>`）。
+
+- **外掛（Plugin）系統**：偵測根目錄下的子資料夾，若 `<名稱>/<名稱>.py` 存在即載入為外掛。**目前僅支援同時啟用單一外掛**（優先載入第一個偵測到的外掛）。
+
 - **失敗日誌**：安裝結束後自動於桌面產生 `<程式名稱>_Log_<時間戳>.txt`，分兩層記錄：
   - **verifyFAILURES**（最終確認失敗）：以 `winget list` / `sc qc` 反向比對，確認安裝或服務停用實際未生效的項目。`winget` 驗證採用 `id/name/source` 多重 fallback，降低誤判。
   - **Runtime Warnings**：執行期間捕捉到的例外，retry 後可能已成功，僅供參考。
-- **外掛（Plugin）系統**：偵測根目錄下的子資料夾，若 `<名稱>/<名稱>.py` 存在即載入為外掛。**目前僅支援同時啟用單一外掛**（優先載入第一個偵測到的外掛）。
 
+- **資料備份**：獨立於安裝流程的互動式選單，可備份桌面、下載、文件、圖片、音樂、影片、AnyDesk 設定至指定目錄（預設為 `D:\backup_<電腦名稱>`）。
 ---
 
 ## 目錄結構
@@ -61,6 +72,7 @@ Windows 自動化佈署工具，以雙擊 `.bat` 的方式完成全機設定。
     ├─ winget.txt
     ├─ *.reg
     ├─ appdata\
+    ├─ localappdata\
     ├─ c\
     ├─ programfiles\
     ├─ desktop\
@@ -131,7 +143,7 @@ Discord.Discord
 ### Zack Mode 範例
 
 參考 `zack/zack.py` 的實作範例，展示了如何：
-- 透過 `custom_files()` 將 `appdata/`、`c/`、`programfiles/`、`desktop/` 鏡像同步到對應系統目錄。
+- 透過 `custom_files()` 將 `appdata/`（對應 `%APPDATA%`）、`localappdata/`（對應 `%LOCALAPPDATA%`）、`c/`、`programfiles/`、`desktop/` 鏡像同步到對應系統目錄。
 - 透過 `custom_setup()` 執行 `setup/Install4j/` 內的安裝檔（同步阻塞執行），並將 `setup/` 根目錄下的 `.exe` 投入背景靜默執行。
 
 ---
