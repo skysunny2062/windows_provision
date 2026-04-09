@@ -1,0 +1,61 @@
+Windows Registry Editor Version 5.00
+
+; ── 工作列設定：停用搜尋框、隱藏工作檢視與小工具、時鐘顯示秒數、工作列按鈕不群組 ──
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Search]
+"SearchboxTaskbarMode"=dword:00000000
+
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced]
+"TaskbarAl"=dword:00000001
+"TaskbarDa"=dword:00000000
+"ShowTaskViewButton"=dword:00000000
+"ShowSecondsInSystemClock"=dword:00000001
+"TaskbarGlomLevel"=dword:00000002
+
+; ── 佈景主題設定：在工作列與開始功能表顯示色彩 ──
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize]
+"ColorPrevalence"=dword:00000001
+
+; ── 檔案總管設定：還原 Windows 10 傳統右鍵選單 ──
+[HKEY_CURRENT_USER\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32]
+@=""
+
+; ── 檔案總管設定：自訂資料夾捷徑圖示 ──
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons]
+"29"="C:\\Windows\\system32\\imageres.dll,197"
+"77"="C:\\Windows\\system32\\imageres.dll,197"
+
+; ── 電源選單設定：顯示休眠選項、隱藏睡眠選項 ──
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FlyoutMenuSettings]
+"ShowHibernateOption"=dword:00000001
+"ShowSleepOption"=dword:00000000
+
+; ── 電源計畫設定：接上電源時僅關閉螢幕，停用系統自動睡眠 ──
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Power\PowerSettings\96996BC0-AD50-47EC-923B-6F41874DD9EB]
+"ACSettingIndex"=dword:00000002
+
+; ── 命令提示字元設定：停用 UNC 路徑檢查 ──
+[HKEY_CURRENT_USER\Software\Microsoft\Command Processor]
+"DisableUNCCheck"=dword:00000001
+
+; ── 相片檢視器設定：背景色彩更改為黑色 ──
+[HKEY_CURRENT_USER\Software\Microsoft\Windows Photo Viewer\Viewer]
+"BackgroundColor"=dword:ff000000
+
+; ── 系統可靠度監視器：停用時間戳記記錄以減少磁碟寫入 ──
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Reliability]
+"TimeStampInterval"=dword:00000000
+
+; ── 記憶體管理：停用分頁執行，強制將核心與系統驅動程式保留在實體記憶體 ──
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\Session Manager\Memory Management]
+"DisablePagingExecutive"=dword:00000001
+
+; ── 系統功能：啟用 Windows 11 原生 NVMe 支援 ──
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides]
+"735209102"=dword:00000001
+"1853569164"=dword:00000001
+"156965516"=dword:00000001
+
+; ── 網際網路選項：將內網 192.168 網段加入近端內部網路信任區域 ──
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings\ZoneMap\Ranges\Range1]
+"*"=dword:00000001
+":Range"="192.168.*.*"

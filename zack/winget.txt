@@ -1,0 +1,6 @@
+# zack\winget.txt
+
+Aegisub.Aegisub
+GitHub.GitLFS,exact
+MoritzBunkus.MKVToolNix
+Telegram.TelegramDesktop,exact
